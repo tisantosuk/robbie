@@ -1,0 +1,202 @@
+'use strict';
+// Robbie v3.1 phone page. No secrets in this file: the backend URL and passphrase arrive once in the link (#u=...&p=...)
+// and are kept in this phone's browser storage.
+
+const $ = (id) => document.getElementById(id);
+const SAMPLE_RATE = 16000;
+const MAX_SEGMENT_S = 30;
+const state = {
+  cfg: null, sessionId: null, vad: null, speaking: false, closed: true,
+  queue: Promise.resolve(), wakeLock: null, pending: [], history: [], turns: 0,
+  voices: [], voiceIndex: 0, cancelSpeech: null,
+};
+
+function setMode(mode, status, hint) {
+  document.body.className = mode;
+  if (status !== undefined) $('status').textContent = status;
+  if (hint !== undefined) $('hint').textContent = hint;
+}
+
+// ---------- configuration ----------
+function loadConfig() {
+  let h = null;
+  try { h = new URLSearchParams(location.hash.slice(1)); } catch {}
+  const u = h && h.get('u'); const p = h && h.get('p');
+  if (u && p && /^(https:\/\/|http:\/\/localhost[:/])/.test(u)) {
+    try { localStorage.setItem('robbie_cfg', JSON.stringify({ url: u, pass: p })); } catch {}
+  }
+  if (location.hash) history.replaceState(null, '', location.pathname + location.search); // keep any query string
+  try { return JSON.parse(localStorage.getItem('robbie_cfg') || 'null'); } catch { return null; }
+}
+
+async function api(action, data = {}) {
+  const res = await fetch(state.cfg.url, {
+    method: 'POST', redirect: 'follow',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // no CORS preflight (Apps Script cannot answer one)
+    body: JSON.stringify({ action, passphrase: state.cfg.pass, ...data }),
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const out = await res.json();
+  if (out.error) throw new Error(out.error);
+  return out;
+}
+
+// ---------- voice out (phone's own pt-BR voice) ----------
+function loadVoices() {
+  const all = window.speechSynthesis ? speechSynthesis.getVoices() : [];
+  const br = all.filter((v) => /^pt[-_]BR/i.test(v.lang));
+  state.voices = br.length ? br : all.filter((v) => /^pt/i.test(v.lang));
+  try { state.voiceIndex = Math.min(Number(localStorage.getItem('robbie_voice') || 0), Math.max(0, state.voices.length - 1)); } catch {}
+}
+if (window.speechSynthesis) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
+
+function unlockSpeech() { // must run inside the start tap
+  if (!window.speechSynthesis) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(' '); u.volume = 0; u.lang = 'pt-BR';
+  speechSynthesis.speak(u);
+}
+
+function stopPlayback() {
+  if (window.speechSynthesis) speechSynthesis.cancel();
+  if (state.cancelSpeech) state.cancelSpeech(); // Android may not fire onend after cancel()
+}
+
+async function say(text) {
+  if (!text) return;
+  state.speaking = true;
+  if (state.vad) await state.vad.pause(); // microphone off while Robbie speaks: no self-interruption
+  setMode('speaking', 'Robbie falando', 'Toque na tela para interromper.');
+  $('last').textContent = 'Robbie: ' + text;
+  try {
+    await new Promise((resolve) => {
+      const timer = setTimeout(done, 3000 + text.split(' ').length * 600); // safety: some phones skip onend
+      function done() { clearTimeout(timer); state.cancelSpeech = null; resolve(); }
+      state.cancelSpeech = done;
+      if (!window.speechSynthesis) return done();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'pt-BR';
+      if (state.voices[state.voiceIndex]) u.voice = state.voices[state.voiceIndex];
+      u.onend = done; u.onerror = done;
+      speechSynthesis.speak(u);
+    });
+  } finally {
+    state.speaking = false;
+    if (!state.closed && state.vad) { await state.vad.start(); setMode('listening', 'Ouvindo', 'Quando terminar, diga "o que você acha?" ou "sua vez".'); }
+  }
+}
+
+document.addEventListener('click', (e) => {
+  if (state.speaking && !e.target.closest('footer')) stopPlayback(); // tap anywhere to interrupt
+});
+
+// ---------- voice in ----------
+function chunks(audio) { // CH-31-A: at most 30 s per request
+  const max = SAMPLE_RATE * MAX_SEGMENT_S;
+  const out = [];
+  for (let i = 0; i < audio.length; i += max) out.push(audio.subarray(i, i + max));
+  return out;
+}
+
+function sendSegment(audio) {
+  const utils = window.vad && window.vad.utils; // Gemini review 1445, Defect 2: no implicit global
+  if (!utils) { setMode('listening', 'Ouvindo', 'Falha ao preparar o áudio. Recarregue a página.'); return; }
+  for (const part of chunks(audio)) {
+    const b64 = utils.arrayBufferToBase64(utils.encodeWAV(part, 1, SAMPLE_RATE, 1, 16));
+    state.queue = state.queue.then(() => processSegment(b64));
+  }
+}
+
+async function processSegment(b64) {
+  if (state.closed) return;
+  setMode('thinking', 'Pensando', undefined);
+  const t0 = performance.now();
+  try {
+    const r = await api('turn', { audio: b64, pending: state.pending, history: state.history });
+    const ms = Math.round(performance.now() - t0);
+    $('timing').textContent = `Ida e volta: ${(ms / 1000).toFixed(1)} s` + (r.geminiMs ? ` (Gemini ${(r.geminiMs / 1000).toFixed(1)} s)` : '');
+    state.pending = r.pending || [];
+    state.history = r.history || state.history;
+    if (r.transcript) $('last').textContent = 'Você: ' + r.transcript;
+    if (r.closed) state.closed = true; // keep the microphone off after the goodbye
+    if (r.speak) { state.turns += 1; await say(r.text); }
+    else if (!state.closed) setMode('listening', 'Ouvindo', 'Pode continuar. Robbie espera o seu sinal.');
+    if (r.closed) await finish(r.reason === 'daily_limit' ? 'daily_limit' : 'voice');
+  } catch (err) {
+    setMode('listening', 'Ouvindo', 'Falha: ' + err.message + '. Pode repetir.');
+  }
+}
+
+async function keepAwake() {
+  try { if ('wakeLock' in navigator) state.wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && !state.closed) keepAwake(); });
+
+$('start').addEventListener('click', async () => {
+  unlockSpeech();
+  $('start').classList.add('hidden');
+  setMode('thinking', 'Preparando', 'Permita o uso do microfone.');
+  try {
+    await keepAwake();
+    if (!(window.vad && window.vad.MicVAD && window.vad.utils)) throw new Error('áudio não carregou; recarregue a página');
+    if (!state.vad) {
+      state.vad = await window.vad.MicVAD.new({
+        model: 'v5', baseAssetPath: new URL('vad/', location.href).href, onnxWASMBasePath: new URL('ort/', location.href).href,
+        positiveSpeechThreshold: 0.5, negativeSpeechThreshold: 0.35,
+        redemptionMs: 1400, preSpeechPadMs: 300, minSpeechMs: 400, startOnLoad: false,
+        getStream: () => navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        }),
+        onSpeechStart: () => { if (!state.speaking) setMode('speech', 'Ouvindo você', undefined); },
+        onVADMisfire: () => { if (!state.speaking) setMode('listening', 'Ouvindo', undefined); },
+        onSpeechEnd: (audio) => sendSegment(audio),
+      });
+    }
+    const t0 = performance.now();
+    const s = await api('start');
+    $('timing').textContent = `Início: ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+    state.sessionId = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now());
+    state.pending = []; state.history = []; state.turns = 0; state.closed = false;
+    $('memory').textContent = s.memoryValue ? 'Memória: ' + s.memoryValue : '';
+    $('controls').classList.remove('hidden');
+    await say(s.greeting);
+  } catch (err) {
+    setMode('', 'Não consegui começar', String(err.message || err));
+    $('start').classList.remove('hidden');
+  }
+});
+
+async function finish(reason) {
+  state.closed = true;
+  if (state.vad) { await state.vad.pause(); }
+  if (state.wakeLock) { state.wakeLock.release().catch(() => {}); state.wakeLock = null; }
+  $('controls').classList.add('hidden');
+  let msg = 'Conversa salva. Até a próxima.';
+  try { await api('end', { sessionId: state.sessionId, turns: state.turns, reason }); }
+  catch { msg = 'Encerrado (não consegui confirmar o salvamento).'; }
+  setMode('', msg, '');
+  $('start').textContent = 'Começar de novo';
+  $('start').classList.remove('hidden');
+}
+
+$('end').addEventListener('click', () => { stopPlayback(); finish('button'); });
+
+$('voice').addEventListener('click', async () => {
+  if (!state.voices.length) { await say('Este celular tem só uma voz em português.'); return; }
+  state.voiceIndex = (state.voiceIndex + 1) % state.voices.length;
+  try { localStorage.setItem('robbie_voice', String(state.voiceIndex)); } catch {}
+  await say(`Esta é a voz ${state.voiceIndex + 1} de ${state.voices.length}.`);
+});
+
+window.addEventListener('pagehide', () => {
+  if (!state.closed && state.cfg && navigator.sendBeacon) {
+    navigator.sendBeacon(state.cfg.url, new Blob([JSON.stringify({
+      action: 'end', passphrase: state.cfg.pass, sessionId: state.sessionId, turns: state.turns, reason: 'pagehide',
+    })], { type: 'text/plain;charset=utf-8' }));
+  }
+});
+
+// ---------- boot ----------
+state.cfg = loadConfig();
+if (!state.cfg) setMode('', 'Robbie ainda não configurado', 'Abra o link do QR code da página de configuração.');
+else { $('start').classList.remove('hidden'); setMode('', 'Pronto', 'Toque em Começar. Depois, é só conversar.'); }
