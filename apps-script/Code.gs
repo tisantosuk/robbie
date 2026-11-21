@@ -51,7 +51,7 @@ function saveSetup(key) {
   var props = PropertiesService.getScriptProperties();
   if (props.getProperty('GEMINI_API_KEY')) throw new Error('Já configurado.');
   key = String(key || '').trim();
-  if (!/^[A-Za-z0-9_\-]{30,60}$/.test(key)) throw new Error('A chave não parece válida.');
+  if (!/^[A-Za-z0-9_.\-]{20,200}$/.test(key)) throw new Error('A chave não parece válida.'); // AIza... and newer AQ.... keys; Google's own check follows
   var test = UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000',
     { headers: { 'x-goog-api-key': key }, muteHttpExceptions: true });
   if (test.getResponseCode() !== 200) throw new Error('O Google recusou a chave (' + test.getResponseCode() + ').');
