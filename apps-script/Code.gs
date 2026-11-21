@@ -13,6 +13,13 @@ var MAX_CONSULT_CHARS = 200000;
 var SHORT_LIMIT = 20;
 var LONG_LIMIT = 80;
 var PAGES_URL = 'https://tisantosuk.github.io/robbie/';
+var DEFAULT_TTS_MODEL = 'gemini-2.5-flash-preview-tts';
+var DEFAULT_TTS_VOICE = 'Aoede';
+var TTS_STYLE_VERSION = 's1';    // change when the TTS style text below changes
+var DAILY_BENCH_LIMIT = 80;      // Claude's latency/voice measurements per London day
+var TTS_VOICES = ['Zephyr','Puck','Charon','Kore','Fenrir','Leda','Orus','Aoede','Callirrhoe','Autonoe','Enceladus','Iapetus','Umbriel','Algieba',
+  'Despina','Erinome','Algenib','Rasalgethi','Laomedeia','Achernar','Alnilam','Schedar','Gacrux','Pulcherrima','Achird','Zubenelgenubi',
+  'Vindemiatrix','Sadachbia','Sadaltager','Sulafat'];
 
 // ---------------------------------------------------------------- entry points
 
@@ -37,6 +44,9 @@ function doPost(e) {
       case 'end': return json_(end_(req));
       case 'consult': return json_(consult_(req));
       case 'models': return json_(listModels_());
+      case 'bench': return json_(bench_(req));       // Claude: measure one model setting on a recording
+      case 'tts_test': return json_(ttsTest_(req));  // Claude: measure one voice setting
+      case 'set_config': return json_(setConfig_(req)); // Claude: apply the agreed model/voice settings
       default: return json_({ error: 'unknown action' });
     }
   } catch (err) {
@@ -93,7 +103,11 @@ function start_() {
     memory = String(memorySheet_(false).getSheetByName('Config').getRange('B1').getValue() || '');
     cache.put('memory_check', memory, 600);
   }
-  return { greeting: 'Oi Ti, aqui é o Robbie. Como você está?', memoryValue: memory, model: cfg.model };
+  var greeting = 'Oi Ti, aqui é o Robbie. Como você está?';
+  var out = { greeting: greeting, memoryValue: memory, model: cfg.model };
+  var audio = greetingAudio_(cfg, greeting);
+  if (audio) { out.audio = audio.data; out.audioRate = audio.rate; }
+  return out;
 }
 
 function turn_(req) {
@@ -118,8 +132,9 @@ function turn_(req) {
       pending: [], history: history, geminiMs: geminiMs };
   }
 
+  var firstSegment = pending.length === 0;
   pending.push(transcript);
-  var decision = r.urgent ? { complete: true, reason: 'urgent' } : isTurnComplete(transcript, r.addressed_question);
+  var decision = r.urgent ? { complete: true, reason: 'urgent' } : isTurnComplete(transcript, r.addressed_question, firstSegment);
   if (!decision.complete) return { transcript: transcript, speak: false, reason: decision.reason, pending: pending, history: history, geminiMs: geminiMs };
 
   var full = pending.join(' ');
@@ -132,7 +147,11 @@ function turn_(req) {
     reply = capReply(r.reply, wantsExplanation(full) ? LONG_LIMIT : SHORT_LIMIT) || 'Hmm, me conta mais?';
   }
   history.push({ ti: full, robbie: reply });
-  return { transcript: transcript, speak: true, reason: decision.reason, text: reply, pending: [], history: history.slice(-20), geminiMs: geminiMs };
+  var out = { transcript: transcript, speak: true, reason: decision.reason, text: reply, pending: [], history: history.slice(-20), geminiMs: geminiMs };
+  var t1 = Date.now();
+  var audio = ttsSafe_(cfg, reply); // V-1: same round trip; on any failure the phone uses its own voice
+  if (audio) { out.audio = audio.data; out.audioRate = audio.rate; out.ttsMs = Date.now() - t1; }
+  return out;
 }
 
 function end_(req) {
@@ -201,6 +220,7 @@ function analyseSegment_(cfg, audioB64, pendingText, history) {
     contents: contents,
     generationConfig: { responseMimeType: 'application/json', responseSchema: RESPONSE_SCHEMA, temperature: 0.7, maxOutputTokens: 1024 },
   };
+  if (cfg.thinking) body.generationConfig.thinkingConfig = cfg.thinking;
   var data = gemini_(cfg, body);
   var txt = ((((data.candidates || [])[0] || {}).content || {}).parts || []).map(function (p) { return p.text || ''; }).join('');
   var parsed = JSON.parse(txt);
@@ -208,8 +228,8 @@ function analyseSegment_(cfg, audioB64, pendingText, history) {
     urgent: Boolean(parsed.urgent), reply: String(parsed.reply || '') };
 }
 
-function gemini_(cfg, body) {
-  var res = UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(cfg.model) + ':generateContent', {
+function gemini_(cfg, body, model) {
+  var res = UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model || cfg.model) + ':generateContent', {
     method: 'post', contentType: 'application/json', headers: { 'x-goog-api-key': cfg.key },
     payload: JSON.stringify(body), muteHttpExceptions: true,
   });
@@ -260,7 +280,7 @@ var STRONG_SIGNALS = ['sua vez', 'o que voce acha', 'o que voce pensa', 'qual su
 var WEAK_SIGNALS = ['e ai', 'faz sentido'];
 var STRONG_WINDOW_WORDS = 6;
 function lastWords_(norm, n) { return norm.replace(/\?/g, '').split(' ').filter(Boolean).slice(-n).join(' '); }
-function isTurnComplete(segment, addressedQuestion) {
+function isTurnComplete(segment, addressedQuestion, firstSegment) {
   var norm = normalise(segment);
   if (!norm) return { complete: false, reason: 'empty' };
   var plain = ' ' + norm.replace(/\?/g, '').replace(/\s+/g, ' ').trim() + ' ';
@@ -283,6 +303,12 @@ function isTurnComplete(segment, addressedQuestion) {
   var lastSentence = sentences[sentences.length - 1] || '';
   var addressed = /\b(voce|robbie)\b/.test(lastSentence);
   if (addressedQuestion && endsWithQuestion && addressed) return { complete: true, reason: 'question-to-robbie' };
+  // V-2: a whole turn that is only a short check-in question ("oi, tudo bem?"), never a self-directed one.
+  var words = plain.trim().split(' ').filter(Boolean);
+  var selfDirected = /^(por que|porque|sera que|como eu|o que eu|eu nao sei)\b/.test(plain.trim()) || /\b(eu|me|mim|meu|minha|comigo)\b/.test(plain);
+  if (firstSegment && addressedQuestion && endsWithQuestion && sentences.length === 1 && words.length <= 5 && !selfDirected) {
+    return { complete: true, reason: 'short-check-in' };
+  }
   return { complete: false, reason: 'no-signal' };
 }
 function isClosing(segment) {
@@ -310,7 +336,126 @@ function config_() {
   var p = PropertiesService.getScriptProperties();
   var key = p.getProperty('GEMINI_API_KEY');
   if (!key) throw new Error('not configured');
-  return { key: key, model: p.getProperty('GEMINI_MODEL') || DEFAULT_MODEL };
+  var thinking = null;
+  try { thinking = JSON.parse(p.getProperty('THINKING_CONFIG') || 'null'); } catch (e) { thinking = null; }
+  return { key: key, model: p.getProperty('GEMINI_MODEL') || DEFAULT_MODEL, thinking: thinking,
+    ttsOn: p.getProperty('TTS_ENABLED') !== 'false', ttsModel: p.getProperty('TTS_MODEL') || DEFAULT_TTS_MODEL,
+    ttsVoice: p.getProperty('TTS_VOICE') || DEFAULT_TTS_VOICE };
+}
+
+// ---------------------------------------------------------------- voice (V-1: Gemini TTS on the free key, silent fallback)
+
+function tts_(cfg, text, model, voice) {
+  var body = {
+    contents: [{ parts: [{ text: 'Fale em português do Brasil, com voz natural, calorosa e calma: ' + text }] }],
+    generationConfig: { responseModalities: ['AUDIO'],
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice || cfg.ttsVoice } } } },
+  };
+  var data = gemini_(cfg, body, model || cfg.ttsModel);
+  var part = ((((data.candidates || [])[0] || {}).content || {}).parts || []).filter(function (x) { return x.inlineData; })[0];
+  if (!part) throw new Error('TTS returned no audio');
+  var m = /rate=(\d+)/.exec(part.inlineData.mimeType || '');
+  return { data: part.inlineData.data, rate: m ? Number(m[1]) : 24000, mime: part.inlineData.mimeType };
+}
+
+function ttsSafe_(cfg, text) {
+  if (!cfg.ttsOn || !text) return null;
+  var cache = CacheService.getScriptCache();
+  var flag = 'tts_off_' + londonStamp_().slice(0, 10);
+  if (cache.get(flag)) return null; // quota used up today: skip the slow failing call
+  try { return tts_(cfg, text); }
+  catch (err) {
+    if (/Gemini 429/.test(String(err.message))) cache.put(flag, '1', 21600);
+    console.warn('TTS fallback: ' + String(err.message).slice(0, 200));
+    return null;
+  }
+}
+
+function greetingAudio_(cfg, text) { // cached in 90 KB chunks for 6 h, so each session does not spend a TTS request
+  if (!cfg.ttsOn) return null;
+  var cache = CacheService.getScriptCache();
+  var tag = 'greet_' + TTS_STYLE_VERSION + '_' + cfg.ttsModel + '_' + cfg.ttsVoice; // Gemini note 1: new style text -> new cache
+  var meta = cache.get(tag);
+  if (meta) {
+    var parts = meta.split(':'), n = Number(parts[0]), keys = [];
+    for (var i = 0; i < n; i++) keys.push(tag + '_' + i);
+    var got = cache.getAll(keys), data = '';
+    for (var j = 0; j < n; j++) { if (!got[keys[j]]) { data = null; break; } data += got[keys[j]]; }
+    if (data) return { data: data, rate: Number(parts[1]) };
+  }
+  var a = ttsSafe_(cfg, text);
+  if (!a) return null;
+  var chunks = {}, size = 90000, count = Math.ceil(a.data.length / size);
+  for (var k = 0; k < count; k++) chunks[tag + '_' + k] = a.data.slice(k * size, (k + 1) * size);
+  try { cache.putAll(chunks, 21600); cache.put(tag, count + ':' + a.rate, 21600); } catch (e) {}
+  return a;
+}
+
+// ---------------------------------------------------------------- Claude's tuning actions (passphrase-protected, values validated)
+
+function knownModels_(cfg) {
+  var cache = CacheService.getScriptCache();
+  var hit = cache.get('model_list');
+  if (hit) return JSON.parse(hit);
+  var res = UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000',
+    { headers: { 'x-goog-api-key': cfg.key }, muteHttpExceptions: true });
+  if (res.getResponseCode() !== 200) throw new Error('models ' + res.getResponseCode());
+  var names = modelNames_(JSON.parse(res.getContentText()));
+  cache.put('model_list', JSON.stringify(names), 3600);
+  return names;
+}
+
+function cleanThinking_(t) {
+  if (t === null || t === undefined || t === '') return null;
+  if (typeof t !== 'object') throw new Error('thinking must be an object');
+  var out = {};
+  if ('thinkingBudget' in t) { var b = Number(t.thinkingBudget); if (!(b >= -1 && b <= 2048)) throw new Error('bad thinkingBudget'); out.thinkingBudget = b; }
+  if ('thinkingLevel' in t) { if (!/^(minimal|low|medium|high)$/.test(String(t.thinkingLevel))) throw new Error('bad thinkingLevel'); out.thinkingLevel = String(t.thinkingLevel); }
+  return Object.keys(out).length ? out : null;
+}
+
+function bench_(req) {
+  var cfg = config_();
+  if (!req.audio || String(req.audio).length > MAX_AUDIO_B64) return { error: 'audio missing or longer than 30 seconds' };
+  var model = String(req.model || cfg.model);
+  if (knownModels_(cfg).indexOf(model) < 0) return { error: 'model not offered to this key' };
+  if (!bump_('bench', DAILY_BENCH_LIMIT)) return { error: 'daily bench limit reached' };
+  var run = { key: cfg.key, model: model, thinking: cleanThinking_(req.thinking) };
+  var t0 = Date.now();
+  try {
+    var r = analyseSegment_(run, req.audio, '', []);
+    return { model: model, thinking: run.thinking, ms: Date.now() - t0, transcript: r.transcript, addressed_question: r.addressed_question, reply: r.reply };
+  } catch (err) { return { model: model, thinking: run.thinking, ms: Date.now() - t0, error: String(err.message).slice(0, 300) }; }
+}
+
+function ttsTest_(req) {
+  var cfg = config_();
+  var voice = String(req.voice || cfg.ttsVoice), model = String(req.model || cfg.ttsModel);
+  if (TTS_VOICES.indexOf(voice) < 0) return { error: 'unknown voice' };
+  if (!/tts/.test(model)) return { error: 'not a TTS model' };
+  if (!bump_('bench', DAILY_BENCH_LIMIT)) return { error: 'daily bench limit reached' };
+  var text = String(req.text || 'Oi Ti, aqui é o Robbie. Como você está?').slice(0, 300);
+  var t0 = Date.now();
+  try {
+    var a = tts_(cfg, text, model, voice);
+    var out = { model: model, voice: voice, ms: Date.now() - t0, rate: a.rate, mime: a.mime, bytes: Math.round(a.data.length * 3 / 4) };
+    if (req.returnAudio) out.audio = a.data;
+    return out;
+  } catch (err) { return { model: model, voice: voice, ms: Date.now() - t0, error: String(err.message).slice(0, 300) }; }
+}
+
+function setConfig_(req) {
+  var cfg = config_();
+  var p = PropertiesService.getScriptProperties();
+  var set = {};
+  if (req.model !== undefined) { if (knownModels_(cfg).indexOf(String(req.model)) < 0) return { error: 'model not offered to this key' }; set.GEMINI_MODEL = String(req.model); }
+  if (req.thinking !== undefined) { var t = cleanThinking_(req.thinking); set.THINKING_CONFIG = t ? JSON.stringify(t) : ''; }
+  if (req.ttsModel !== undefined) { if (!/tts/.test(String(req.ttsModel))) return { error: 'not a TTS model' }; set.TTS_MODEL = String(req.ttsModel); }
+  if (req.ttsVoice !== undefined) { if (TTS_VOICES.indexOf(String(req.ttsVoice)) < 0) return { error: 'unknown voice' }; set.TTS_VOICE = String(req.ttsVoice); }
+  if (req.ttsEnabled !== undefined) set.TTS_ENABLED = req.ttsEnabled ? 'true' : 'false';
+  p.setProperties(set);
+  var now = config_();
+  return { model: now.model, thinking: now.thinking, ttsOn: now.ttsOn, ttsModel: now.ttsModel, ttsVoice: now.ttsVoice };
 }
 
 function memorySheet_(createIfMissing) {

@@ -8,7 +8,7 @@ const MAX_SEGMENT_S = 30;
 const state = {
   cfg: null, sessionId: null, vad: null, speaking: false, closed: true,
   queue: Promise.resolve(), wakeLock: null, pending: [], history: [], turns: 0,
-  voices: [], voiceIndex: 0, cancelSpeech: null,
+  voices: [], voiceIndex: 0, cancelSpeech: null, audioCtx: null,
 };
 
 function setMode(mode, status, hint) {
@@ -51,6 +51,10 @@ function loadVoices() {
 if (window.speechSynthesis) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
 
 function unlockSpeech() { // must run inside the start tap
+  try { // Gemini voice playback (V-1): the audio context must be unlocked by a tap on Android
+    if (!state.audioCtx) state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (state.audioCtx.state === 'suspended') state.audioCtx.resume();
+  } catch {}
   if (!window.speechSynthesis) return;
   speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(' '); u.volume = 0; u.lang = 'pt-BR';
@@ -62,7 +66,38 @@ function stopPlayback() {
   if (state.cancelSpeech) state.cancelSpeech(); // Android may not fire onend after cancel()
 }
 
-async function say(text) {
+function pcmBuffer(b64, rate) { // 16-bit signed little-endian mono PCM -> AudioBuffer
+  const bin = atob(b64);
+  const n = bin.length >> 1;
+  const buf = state.audioCtx.createBuffer(1, n, rate || 24000);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) {
+    let v = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
+    if (v >= 32768) v -= 65536;
+    ch[i] = v / 32768;
+  }
+  return buf;
+}
+
+function playGemini(b64, rate, done) { // returns false if this phone cannot play it, so the caller uses the phone voice
+  try {
+    if (!state.audioCtx) return false;
+    const buf = pcmBuffer(b64, rate);
+    const src = state.audioCtx.createBufferSource();
+    src.buffer = buf; src.connect(state.audioCtx.destination);
+    const timer = setTimeout(finish, buf.duration * 1000 + 2000);
+    let ended = false;
+    function finish() { if (ended) return; ended = true; clearTimeout(timer); state.cancelSpeech = null; done(); }
+    src.onended = finish;
+    state.cancelSpeech = () => { try { src.stop(); } catch {} finish(); };
+    const go = () => { try { src.start(); } catch { finish(); } };
+    if (state.audioCtx.state === 'suspended') state.audioCtx.resume().then(go, go); // Gemini note 2: start after resume
+    else go();
+    return true;
+  } catch { return false; }
+}
+
+async function say(text, audio, rate) {
   if (!text) return;
   state.speaking = true;
   if (state.vad) await state.vad.pause(); // microphone off while Robbie speaks: no self-interruption
@@ -73,6 +108,7 @@ async function say(text) {
       const timer = setTimeout(done, 3000 + text.split(' ').length * 600); // safety: some phones skip onend
       function done() { clearTimeout(timer); state.cancelSpeech = null; resolve(); }
       state.cancelSpeech = done;
+      if (audio && playGemini(audio, rate, resolve)) { clearTimeout(timer); return; } // else: phone voice below
       if (!window.speechSynthesis) return done();
       const u = new SpeechSynthesisUtterance(text);
       u.lang = 'pt-BR';
@@ -114,12 +150,12 @@ async function processSegment(b64) {
   try {
     const r = await api('turn', { audio: b64, pending: state.pending, history: state.history });
     const ms = Math.round(performance.now() - t0);
-    $('timing').textContent = `Ida e volta: ${(ms / 1000).toFixed(1)} s` + (r.geminiMs ? ` (Gemini ${(r.geminiMs / 1000).toFixed(1)} s)` : '');
+    $('timing').textContent = `Ida e volta: ${(ms / 1000).toFixed(1)} s` + (r.geminiMs ? ` (Gemini ${(r.geminiMs / 1000).toFixed(1)} s` + (r.ttsMs ? `, voz ${(r.ttsMs / 1000).toFixed(1)} s` : '') + ')' : '');
     state.pending = r.pending || [];
     state.history = r.history || state.history;
     if (r.transcript) $('last').textContent = 'Você: ' + r.transcript;
     if (r.closed) state.closed = true; // keep the microphone off after the goodbye
-    if (r.speak) { state.turns += 1; await say(r.text); }
+    if (r.speak) { state.turns += 1; await say(r.text, r.audio, r.audioRate); }
     else if (!state.closed) setMode('listening', 'Ouvindo', 'Pode continuar. Robbie espera o seu sinal.');
     if (r.closed) await finish(r.reason === 'daily_limit' ? 'daily_limit' : 'voice');
   } catch (err) {
@@ -159,7 +195,7 @@ $('start').addEventListener('click', async () => {
     state.pending = []; state.history = []; state.turns = 0; state.closed = false;
     $('memory').textContent = s.memoryValue ? 'Memória: ' + s.memoryValue : '';
     $('controls').classList.remove('hidden');
-    await say(s.greeting);
+    await say(s.greeting, s.audio, s.audioRate);
   } catch (err) {
     setMode('', 'Não consegui começar', String(err.message || err));
     $('start').classList.remove('hidden');
