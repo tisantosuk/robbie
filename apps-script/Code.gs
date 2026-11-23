@@ -1,5 +1,5 @@
 /**
- * Robbie v3.5 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
+ * Robbie v3.6 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
  * Deploy: Execute as "Me", Who has access "Anyone".
  * Secrets live only in Script Properties (set by the one-time setup page): GEMINI_API_KEY, PASSPHRASE.
  * This file contains no keys, passphrases or spreadsheet IDs, so it can sit in a public repository.
@@ -126,7 +126,7 @@ function turn_(req) {
   var out = turnCore_(req, holder);
   // Gemini review 1053, Defect 2: analysis passed explicitly; silent segments (no speech) are not written
   if (out.transcript || out.busy || out.error || out.closed) {
-    try { logTurn_(req, out, holder.analysis || null); } catch (e) { console.warn('turn log failed: ' + e); }
+    try { logTurn_(req, out, holder.analysis || null, holder.calendar); } catch (e) { console.warn('turn log failed: ' + e); }
   }
   return out;
 }
@@ -144,7 +144,9 @@ function turnCore_(req, holder) {
 
   var t0 = Date.now();
   var r;
-  try { r = analyseSegment_(cfg, req.audio, pending.join(' '), history); holder.analysis = r; }
+  var cal = calendarDigest_(req); // Increment 1: today's agenda, read-only, cached 5 min
+  holder.calendar = cal.status;
+  try { r = analyseSegment_(cfg, req.audio, pending.join(' '), history, cal.text); holder.analysis = r; }
   catch (err) { // Gemini review 1703, Defect 1: a second 500/503 is not a failure on Ti's screen; the phone re-sends once
     if (/Gemini (500|503)/.test(String(err.message))) return { busy: true, speak: false, transcript: '', pending: pending, history: history };
     throw err;
@@ -234,14 +236,14 @@ function listModels_() {
 
 // ---------------------------------------------------------------- Gemini
 
-function analyseSegment_(cfg, audioB64, pendingText, history) {
+function analyseSegment_(cfg, audioB64, pendingText, history, agenda) {
   var contents = [];
   history.forEach(function (h) {
     contents.push({ role: 'user', parts: [{ text: String(h.ti || '') }] });
     contents.push({ role: 'model', parts: [{ text: String(h.robbie || '') }] });
   });
   contents.push({ role: 'user', parts: [
-    { text: segmentInstruction(pendingText) },
+    { text: (agenda ? agenda + '\n' : '') + segmentInstruction(pendingText) },
     { inlineData: { mimeType: 'audio/wav', data: audioB64 } },
   ] });
   var body = {
@@ -283,7 +285,8 @@ function systemInstruction() {
     'Faça no máximo uma pergunta por resposta. Prefira perguntar a dar conselho. Não repita o que ele acabou de dizer.',
     'Humor leve e seco é bem-vindo quando o momento permite, ligado ao que ele disse. Nunca faça humor sobre sofrimento, crise ou assuntos sensíveis, a não ser que ele brinque primeiro.',
     'Não faça suposições sobre o estado ou as intenções dele; pergunte.',
-    'Você não tem acesso ao calendário, e-mail, internet ou arquivos do Ti. Se ele pedir algo assim, diga isso numa frase curta e não invente.',
+    'Você vê só a agenda de HOJE do calendário principal do Ti (conta tisantos.uk@gmail.com), quando ela vier na mensagem. Responda sobre ela com os horários exatos dados; não invente eventos.',
+    'Você não vê outros dias, outras contas, e-mail, internet ou arquivos do Ti. Se ele pedir algo assim, diga isso numa frase curta e não invente.',
     'Segurança: se o Ti falar em se machucar, em não querer viver, ou em perigo imediato, responda com cuidado, pergunte diretamente se ele está seguro, e lembre que o Samaritans atende 24 horas no 116 123 no Reino Unido e o CVV no 188 no Brasil.',
   ].join('\n');
 }
@@ -416,7 +419,55 @@ function ttsSafe_(cfg, text, why) {
   return null;
 }
 
-function logTurn_(req, out, analysis) {
+// ---------------------------------------------------------------- Increment 1: today's calendar (read-only scope in appsscript.json)
+
+// "Today" is the phone's own day: localDate (YYYY-MM-DD) and tzOffset (minutes, as Date.getTimezoneOffset()) come with each
+// turn; Europe/London is the fallback. Only titles and times are read; no descriptions, guests or locations.
+function phoneDay_(req) {
+  var off = Number(req && req.tzOffset);
+  var date = String((req && req.localDate) || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !(off >= -840 && off <= 840)) {
+    date = Utilities.formatDate(new Date(), 'Europe/London', 'yyyy-MM-dd');
+    var londonNow = new Date(Utilities.formatDate(new Date(), 'Europe/London', "yyyy-MM-dd'T'HH:mm:ss") + 'Z');
+    off = Math.round((Date.now() - londonNow.getTime()) / 60000);
+  }
+  var p = date.split('-').map(Number);
+  var start = new Date(Date.UTC(p[0], p[1] - 1, p[2]) + off * 60000);
+  return { date: date, offset: off, start: start, end: new Date(start.getTime() + 86400000) };
+}
+
+function localHm_(d, offset) {
+  var t = new Date(d.getTime() - offset * 60000);
+  var h = t.getUTCHours(), m = t.getUTCMinutes();
+  return (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m;
+}
+
+function calendarDigest_(req) {
+  if (PropertiesService.getScriptProperties().getProperty('CALENDAR_ENABLED') === 'false') return { text: '', status: 'off' };
+  var day = phoneDay_(req);
+  var cache = CacheService.getScriptCache();
+  var key = 'cal_' + day.date + '_' + day.offset;
+  var hit = cache.get(key);
+  if (hit) { var h = JSON.parse(hit); return { text: h.text, status: h.status + ' (cache)' }; }
+  var out;
+  try {
+    var events = CalendarApp.getDefaultCalendar().getEvents(day.start, day.end).slice(0, 15);
+    var lines = events.map(function (e) {
+      var title = String(e.getTitle() || '(sem título)').replace(/[\u0000-\u001f]/g, ' ').slice(0, 60);
+      if (e.isAllDayEvent()) return '- dia inteiro: ' + title;
+      return '- ' + localHm_(e.getStartTime(), day.offset) + ' a ' + localHm_(e.getEndTime(), day.offset) + ': ' + title;
+    });
+    out = { text: 'Agenda de hoje do Ti (' + day.date + ', calendário principal): ' + (lines.length ? '\n' + lines.join('\n') : 'nenhum evento.'),
+      status: 'events:' + lines.length };
+  } catch (err) {
+    console.warn('calendar read failed: ' + err);
+    out = { text: 'Agenda de hoje do Ti: indisponível agora (erro de leitura). Se ele perguntar, diga que não conseguiu ler a agenda.', status: 'error' };
+  }
+  try { cache.put(key, JSON.stringify(out), 300); } catch (e) {}
+  return out;
+}
+
+function logTurn_(req, out, analysis, calendarStatus) {
   if (PropertiesService.getScriptProperties().getProperty('DEBUG_LOG') === 'false') return;
   var ss = memorySheet_(false);
   var sh = ss.getSheetByName('Turns');
@@ -425,12 +476,13 @@ function logTurn_(req, out, analysis) {
     sh.getRange('A1:M1').setValues([['At (London)', 'Session ID', 'Transcript', 'Ends with ?', 'Model says addressed', 'Reason',
       'Spoke', 'Reply', 'Voice model', 'Voice fallback', 'Gemini ms', 'Voice ms', 'Phone notes']]);
   }
+  if (!sh.getRange('N1').getValue()) sh.getRange('N1').setValues([['Calendar']]);
   var a = analysis || {};
   var notes = (req.clientLog || []).slice(-10).map(function (x) { return String(x).slice(0, 200); }).join(' | ');
   var t = String(out.transcript || '');
   sh.appendRow([londonStamp_(), String(req.sessionId || '').slice(0, 40), t, /\?\s*$/.test(t), analysis ? Boolean(a.addressed_question) : '',
     String(out.reason || (out.busy ? 'busy' : out.error ? 'error' : '')), Boolean(out.speak), String(out.text || ''),
-    String(out.ttsModel || ''), String(out.ttsFallback || ''), out.geminiMs || '', out.ttsMs || '', notes]);
+    String(out.ttsModel || ''), String(out.ttsFallback || ''), out.geminiMs || '', out.ttsMs || '', notes, String(calendarStatus || '')]);
 }
 
 function greetingAudio_(cfg, text) { // cached in 90 KB chunks for 6 h, so each session does not spend a TTS request
@@ -516,6 +568,7 @@ function setConfig_(req) {
   if (req.ttsVoice !== undefined) { if (TTS_VOICES.indexOf(String(req.ttsVoice)) < 0) return { error: 'unknown voice' }; set.TTS_VOICE = String(req.ttsVoice); }
   if (req.ttsEnabled !== undefined) set.TTS_ENABLED = req.ttsEnabled ? 'true' : 'false';
   if (req.debugLog !== undefined) set.DEBUG_LOG = req.debugLog ? 'true' : 'false';
+  if (req.calendarEnabled !== undefined) set.CALENDAR_ENABLED = req.calendarEnabled ? 'true' : 'false';
   p.setProperties(set);
   var now = config_();
   return { model: now.model, thinking: now.thinking, ttsOn: now.ttsOn, ttsModel: now.ttsModel, ttsVoice: now.ttsVoice };

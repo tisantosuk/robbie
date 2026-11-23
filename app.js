@@ -11,6 +11,12 @@ const state = {
   voices: [], voiceIndex: 0, cancelSpeech: null, audioCtx: null, clientLog: [],
 };
 
+function phoneDay() { // Increment 1: Robbie's "today" is the phone's own day (Ti travels between England and Brazil)
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return { localDate: `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`, tzOffset: d.getTimezoneOffset() };
+}
+
 function note(msg) { // v3.4 diagnostics: sent with the next request and written to the Turns tab
   state.clientLog.push(new Date().toISOString().slice(11, 19) + ' ' + msg);
   if (state.clientLog.length > 10) state.clientLog.shift();
@@ -171,10 +177,10 @@ async function processSegment(b64) {
   setMode('thinking', 'Pensando', undefined);
   const t0 = performance.now();
   try {
-    let r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes() });
+    let r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), ...phoneDay() });
     if (r.busy) { // Gemini briefly overloaded: one more try with the same recording
       await new Promise((ok) => setTimeout(ok, 1500));
-      r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes() });
+      r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), ...phoneDay() });
       if (r.busy) { setMode('listening', 'Ouvindo', 'O Gemini está sobrecarregado agora. Pode repetir a última frase?'); return; }
     }
     const ms = Math.round(performance.now() - t0);
