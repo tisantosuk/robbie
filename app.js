@@ -8,7 +8,7 @@ const MAX_SEGMENT_S = 30;
 const state = {
   cfg: null, sessionId: null, vad: null, speaking: false, closed: true,
   queue: Promise.resolve(), wakeLock: null, pending: [], history: [], turns: 0,
-  voices: [], voiceIndex: 0, cancelSpeech: null, audioCtx: null, clientLog: [],
+  voices: [], voiceIndex: 0, cancelSpeech: null, audioCtx: null, clientLog: [], proposal: null,
 };
 
 function phoneDay() { // Increment 1: Robbie's "today" is the phone's own day (Ti travels between England and Brazil)
@@ -177,16 +177,17 @@ async function processSegment(b64) {
   setMode('thinking', 'Pensando', undefined);
   const t0 = performance.now();
   try {
-    let r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), ...phoneDay() });
+    let r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), proposal: state.proposal, ...phoneDay() });
     if (r.busy) { // Gemini briefly overloaded: one more try with the same recording
       await new Promise((ok) => setTimeout(ok, 1500));
-      r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), ...phoneDay() });
+      r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), proposal: state.proposal, ...phoneDay() });
       if (r.busy) { setMode('listening', 'Ouvindo', 'O Gemini está sobrecarregado agora. Pode repetir a última frase?'); return; }
     }
     const ms = Math.round(performance.now() - t0);
     $('timing').textContent = `Ida e volta: ${(ms / 1000).toFixed(1)} s` + (r.geminiMs ? ` (Gemini ${(r.geminiMs / 1000).toFixed(1)} s` + (r.ttsMs ? `, voz ${(r.ttsMs / 1000).toFixed(1)} s` : '') + ')' : '') + (r.ttsFallback ? ' · voz reserva' : '');
     if (r.ttsFallback) console.warn('Robbie voice fallback:', r.ttsFallback);
     state.pending = r.pending || [];
+    if ('proposal' in r) state.proposal = r.proposal; // Increment 1b: event waiting for Ti's yes (held on the phone)
     state.history = r.history || state.history;
     if (r.transcript) $('last').textContent = 'Você: ' + r.transcript;
     if (r.closed) state.closed = true; // keep the microphone off after the goodbye
@@ -227,7 +228,7 @@ $('start').addEventListener('click', async () => {
     const s = await api('start', { hour: new Date().getHours() }); // greeting by the phone's own time of day
     $('timing').textContent = `Início: ${((performance.now() - t0) / 1000).toFixed(1)} s`;
     state.sessionId = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now());
-    state.pending = []; state.history = []; state.turns = 0; state.closed = false;
+    state.pending = []; state.history = []; state.turns = 0; state.closed = false; state.proposal = null;
     $('memory').textContent = s.memoryValue ? 'Memória: ' + s.memoryValue : '';
     $('controls').classList.remove('hidden');
     await say(s.greeting, s.audio, s.audioRate, s.audioFormat);
@@ -252,12 +253,7 @@ async function finish(reason) {
 
 $('end').addEventListener('click', () => { stopPlayback(); finish('button'); });
 
-$('voice').addEventListener('click', async () => {
-  if (!state.voices.length) { await say('Este celular tem só uma voz em português.'); return; }
-  state.voiceIndex = (state.voiceIndex + 1) % state.voices.length;
-  try { localStorage.setItem('robbie_voice', String(state.voiceIndex)); } catch {}
-  await say(`Esta é a voz ${state.voiceIndex + 1} de ${state.voices.length}.`);
-});
+// v3.7 (F-4): the 'Trocar voz' button is removed; the phone voice is only a fallback.
 
 window.addEventListener('pagehide', () => {
   if (!state.closed && state.cfg && navigator.sendBeacon) {

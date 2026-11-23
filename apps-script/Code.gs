@@ -1,5 +1,5 @@
 /**
- * Robbie v3.6.1 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
+ * Robbie v3.7 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
  * Deploy: Execute as "Me", Who has access "Anyone".
  * Secrets live only in Script Properties (set by the one-time setup page): GEMINI_API_KEY, PASSPHRASE.
  * This file contains no keys, passphrases or spreadsheet IDs, so it can sit in a public repository.
@@ -15,8 +15,8 @@ var LONG_LIMIT = 80;
 var PAGES_URL = 'https://tisantosuk.github.io/robbie/';
 var DEFAULT_TTS_MODEL = 'gemini-2.5-flash-preview-tts';
 var DEFAULT_TTS_VOICE = 'Aoede';
-var TTS_STYLE_VERSION = 's1';
-var TTS_BACKUP_MODELS = ['gemini-3.1-flash-tts-preview']; // each TTS model has its own free per-minute quota (3 per minute measured 23 Nov)    // change when the TTS style text below changes
+var TTS_STYLE_VERSION = 's2';
+var TTS_BACKUP_MODELS = []; // v3.7 (F-5): one voice model only, for a consistent voice; the phone voice is the fallback    // change when the TTS style text below changes
 var DAILY_BENCH_LIMIT = 80;      // Claude's latency/voice measurements per London day
 var TTS_VOICES = ['Zephyr','Puck','Charon','Kore','Fenrir','Leda','Orus','Aoede','Callirrhoe','Autonoe','Enceladus','Iapetus','Umbriel','Algieba',
   'Despina','Erinome','Algenib','Rasalgethi','Laomedeia','Achernar','Alnilam','Schedar','Gacrux','Pulcherrima','Achird','Zubenelgenubi',
@@ -108,7 +108,8 @@ function start_(req) {
   var greeting = greetingText_(req && req.hour);
   var out = { greeting: greeting, memoryValue: memory, model: cfg.model };
   var audio = greetingAudio_(cfg, greeting);
-  if (audio) { out.audio = audio.data; out.audioRate = audio.rate; out.audioFormat = audio.format; }
+  if (audio) { out.audio = audio.data; out.audioRate = audio.rate; out.audioFormat = audio.format; out.ttsModel = audio.model || cfg.ttsModel; }
+  try { logTurn_(req || {}, { transcript: '', reason: 'start', speak: true, text: greeting, ttsModel: out.ttsModel || '', ttsFallback: audio ? '' : 'greeting' }, null, ''); } catch (e) {}
   return out;
 }
 
@@ -147,7 +148,8 @@ function turnCore_(req, holder) {
   var r;
   var cal = calendarDigest_(req); // Increment 1: today's agenda, read-only, cached 5 min
   holder.calendar = cal.status;
-  try { r = analyseSegment_(cfg, req.audio, pending.join(' '), history, cal.text); holder.analysis = r; }
+  var proposal = cleanProposal_(req.proposal);
+  try { r = analyseSegment_(cfg, req.audio, pending.join(' '), history, cal.text, proposal ? proposalSentence_(proposal) : ''); holder.analysis = r; }
   catch (err) { // Gemini review 1703, Defect 1: a second 500/503 is not a failure on Ti's screen; the phone re-sends once
     if (/Gemini (500|503)/.test(String(err.message))) return { busy: true, speak: false, transcript: '', pending: pending, history: history };
     throw err;
@@ -159,6 +161,18 @@ function turnCore_(req, holder) {
   if (isClosing(transcript)) {
     return { transcript: transcript, speak: true, closed: true, reason: 'voice', text: 'Tchau, Ti. Guardei nossa conversa.',
       pending: [], history: history, geminiMs: geminiMs };
+  }
+
+  // Increment 1b: create one event after a spoken confirmation
+  var action = String(r.calendar_action || 'none');
+  if (proposal || action === 'propose') {
+    var ev = calendarStep_(req, proposal, action, r, transcript);
+    if (ev) {
+      holder.calendar = ev.log;
+      history.push({ ti: pending.concat([transcript]).join(' '), robbie: ev.text });
+      return withVoice_(cfg, { transcript: transcript, speak: true, reason: 'calendar-' + ev.kind, text: ev.text, proposal: ev.proposal || null,
+        pending: [], history: history.slice(-20), geminiMs: geminiMs });
+    }
   }
 
   var firstSegment = pending.length === 0;
@@ -176,13 +190,107 @@ function turnCore_(req, holder) {
     reply = capReply(r.reply, wantsExplanation(full) ? LONG_LIMIT : SHORT_LIMIT) || 'Hmm, me conta mais?';
   }
   history.push({ ti: full, robbie: reply });
-  var out = { transcript: transcript, speak: true, reason: decision.reason, text: reply, pending: [], history: history.slice(-20), geminiMs: geminiMs };
+  return withVoice_(cfg, { transcript: transcript, speak: true, reason: decision.reason, text: reply, pending: [], history: history.slice(-20), geminiMs: geminiMs });
+}
+
+function withVoice_(cfg, out) {
   var t1 = Date.now();
   var why = {};
-  var audio = ttsSafe_(cfg, reply, why); // V-1: same round trip; on any failure the phone uses its own voice
+  var audio = ttsSafe_(cfg, out.text, why); // V-1: same round trip; on any failure the phone uses its own voice
   if (audio) { out.audio = audio.data; out.audioRate = audio.rate; out.audioFormat = audio.format; out.ttsMs = Date.now() - t1; out.ttsModel = audio.model; }
   else out.ttsFallback = why.reason || 'unknown';
   return out;
+}
+
+// ---------------------------------------------------------------- Increment 1b: create events (Calendar Advanced Service, calendar.events scope)
+
+var DEFAULT_REMINDERS = [10080, 1440, 180, 60, 30]; // Ti's rule: 1 week, 1 day, 3 h, 1 h, 30 min before (popup)
+var DAILY_EVENT_LIMIT = 10;
+var YES_WORDS = /\b(sim|pode|confirma|confirmo|isso|claro|ok|beleza|fechado|pode gravar|grava|manda)\b/;
+var WEEKDAYS = ['domingo', 'segunda', 'terça', 'quarta', 'quinta', 'sexta', 'sábado'];
+
+function cleanProposal_(p) {
+  if (!p || typeof p !== 'object') return null;
+  var e = { title: String(p.title || '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, 80), date: String(p.date || ''),
+    start: String(p.start || ''), end: String(p.end || '') };
+  if (!e.title || !/^\d{4}-\d{2}-\d{2}$/.test(e.date) || !/^\d{2}:\d{2}$/.test(e.start) || !/^\d{2}:\d{2}$/.test(e.end)) return null;
+  e.hash = hash_(e.title + '|' + e.date + '|' + e.start + '|' + e.end);
+  if (p.hash && String(p.hash) !== e.hash) return null; // must be exactly what Robbie spoke
+  return e;
+}
+
+function proposalFrom_(event, day) {
+  if (!event) return { error: 'missing' };
+  var title = String(event.title || '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, 80);
+  var date = String(event.date || ''), start = String(event.start || '').slice(0, 5), end = String(event.end || '').slice(0, 5);
+  if (!title) return { error: 'title' };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { error: 'date' };
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(start)) return { error: 'start' };
+  var toMin = function (hm) { var a = hm.split(':').map(Number); return a[0] * 60 + a[1]; };
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(end)) { var m = Math.min(toMin(start) + 30, 23 * 60 + 59); end = pad2_(Math.floor(m / 60)) + ':' + pad2_(m % 60); }
+  var dur = toMin(end) - toMin(start); // end must be after start on the same day
+  if (!(dur >= 5 && dur <= 240)) return { error: 'duration' };
+  var daysAhead = (Date.UTC.apply(null, ymd_(date)) - Date.UTC.apply(null, ymd_(day.date))) / 86400000;
+  if (!(daysAhead >= 0 && daysAhead <= 365)) return { error: 'date range' };
+  var e = { title: title, date: date, start: start, end: end };
+  e.hash = hash_(e.title + '|' + e.date + '|' + e.start + '|' + e.end);
+  return { proposal: e, daysAhead: daysAhead };
+}
+
+function pad2_(n) { return (n < 10 ? '0' : '') + n; }
+function ymd_(d) { var p = d.split('-').map(Number); return [p[0], p[1] - 1, p[2]]; }
+
+function proposalSentence_(e) { return '"' + e.title + '", ' + spokenDay_(e.date) + ', das ' + e.start + ' às ' + e.end; }
+function spokenDay_(date) {
+  var p = ymd_(date), d = new Date(Date.UTC(p[0], p[1], p[2]));
+  return WEEKDAYS[d.getUTCDay()] + ', ' + p[2] + '/' + pad2_(p[1] + 1);
+}
+
+function isoLocal_(date, hm, offset) { // offset = Date.getTimezoneOffset minutes; returns RFC 3339 with the phone's offset
+  var sign = offset <= 0 ? '+' : '-', a = Math.abs(offset);
+  return date + 'T' + hm + ':00' + sign + pad2_(Math.floor(a / 60)) + ':' + pad2_(a % 60);
+}
+
+// Returns null when the turn is not about the calendar after all (normal conversation continues).
+function calendarStep_(req, proposal, action, r, transcript) {
+  var day = phoneDay_(req);
+  var plain = normalise(transcript);
+  if (proposal && action === 'confirm' && YES_WORDS.test(plain)) {
+    var cache = CacheService.getScriptCache();
+    if (cache.get('created_' + proposal.hash)) {
+      return { kind: 'duplicate', text: 'Esse evento já está no calendário, Ti.', log: 'duplicate: ' + proposal.title };
+    }
+    var recheck = proposalFrom_(proposal, day); // Gemini review 2255, Defect 1: same limits again right before writing
+    if (recheck.error || recheck.proposal.hash !== proposal.hash) {
+      return { kind: 'unclear', text: 'Ti, me diz o dia e o horário do evento?', log: 'refused at confirm: ' + (recheck.error || 'changed') };
+    }
+    if (!bump_('events', DAILY_EVENT_LIMIT)) return { kind: 'limit', text: 'Ti, já criei o limite de 10 eventos hoje.', log: 'limit' };
+    try {
+      var created = Calendar.Events.insert({
+        summary: proposal.title,
+        start: { dateTime: isoLocal_(proposal.date, proposal.start, day.offset) },
+        end: { dateTime: isoLocal_(proposal.date, proposal.end, day.offset) },
+        reminders: { useDefault: false, overrides: DEFAULT_REMINDERS.map(function (m) { return { method: 'popup', minutes: m }; }) },
+      }, 'primary');
+      cache.put('created_' + proposal.hash, String(created && created.id || '1'), 21600);
+      try { cache.remove('cal_' + day.date + '_' + day.offset); } catch (e) {} // today's digest must show it
+      return { kind: 'created', text: 'Pronto, criei ' + proposalSentence_(proposal) + ', com os 5 avisos.', log: 'created: ' + proposal.date + ' ' + proposal.start };
+    } catch (err) {
+      console.warn('event insert failed: ' + err);
+      return { kind: 'error', text: 'Ti, não consegui gravar no calendário agora.', log: 'create error: ' + String(err && err.message || err).slice(0, 100) };
+    }
+  }
+  if (action === 'propose') {
+    var p = proposalFrom_(r.event, day);
+    if (p.error) return { kind: 'unclear', text: 'Ti, me diz o dia e o horário do evento?', log: 'proposal incomplete: ' + p.error };
+    return { kind: 'proposed', proposal: p.proposal, text: 'Vou criar ' + proposalSentence_(p.proposal) + ', com os 5 avisos padrão. Confirma?',
+      log: 'proposed: ' + p.proposal.date + ' ' + p.proposal.start };
+  }
+  if (proposal) { // anything other than a clear yes or a new proposal discards it (Gemini 1831, D-2)
+    if (action === 'cancel') return { kind: 'cancelled', text: 'Tá bom, não criei.', log: 'cancelled' };
+    return { kind: 'discarded', text: 'Não gravei o evento. Se quiser, me pede de novo.', log: 'discarded' };
+  }
+  return null;
 }
 
 function end_(req) {
@@ -237,14 +345,14 @@ function listModels_() {
 
 // ---------------------------------------------------------------- Gemini
 
-function analyseSegment_(cfg, audioB64, pendingText, history, agenda) {
+function analyseSegment_(cfg, audioB64, pendingText, history, agenda, proposalText) {
   var contents = [];
   history.forEach(function (h) {
     contents.push({ role: 'user', parts: [{ text: String(h.ti || '') }] });
     contents.push({ role: 'model', parts: [{ text: String(h.robbie || '') }] });
   });
   contents.push({ role: 'user', parts: [
-    { text: (agenda ? agenda + '\n' : '') + segmentInstruction(pendingText) },
+    { text: (agenda ? agenda + '\n' : '') + segmentInstruction(pendingText, proposalText) },
     { inlineData: { mimeType: 'audio/wav', data: audioB64 } },
   ] });
   var body = {
@@ -263,7 +371,9 @@ function analyseSegment_(cfg, audioB64, pendingText, history, agenda) {
   var txt = ((((data.candidates || [])[0] || {}).content || {}).parts || []).map(function (p) { return p.text || ''; }).join('');
   var parsed = JSON.parse(txt);
   return { transcript: String(parsed.transcript || ''), addressed_question: Boolean(parsed.addressed_question),
-    urgent: Boolean(parsed.urgent), reply: String(parsed.reply || '') };
+    urgent: Boolean(parsed.urgent), reply: String(parsed.reply || ''),
+    calendar_action: /^(propose|confirm|cancel)$/.test(String(parsed.calendar_action)) ? String(parsed.calendar_action) : 'none',
+    event: parsed.event && typeof parsed.event === 'object' ? parsed.event : null };
 }
 
 function gemini_(cfg, body, model) {
@@ -286,27 +396,32 @@ function systemInstruction() {
     'Faça no máximo uma pergunta por resposta. Prefira perguntar a dar conselho. Não repita o que ele acabou de dizer.',
     'Humor leve e seco é bem-vindo quando o momento permite, ligado ao que ele disse. Nunca faça humor sobre sofrimento, crise ou assuntos sensíveis, a não ser que ele brinque primeiro.',
     'Não faça suposições sobre o estado ou as intenções dele; pergunte.',
-    'Você vê só a agenda de HOJE do calendário principal do Ti (conta tisantos.uk@gmail.com), quando ela vier na mensagem. Responda sobre ela com os horários exatos dados; não invente eventos.',
+    'Você vê só a agenda de HOJE do calendário principal do Ti (conta tisantos.uk@gmail.com), quando ela vier na mensagem, com a hora atual. Use os horários exatos; eventos marcados [já passou] você fala no passado; não invente eventos.',
+    'Você pode CRIAR um evento novo no calendário principal quando o Ti pedir: você repete o pedido e só grava depois que ele confirmar. Você não muda nem apaga eventos.',
     'Você não vê outros dias, outras contas, e-mail, internet ou arquivos do Ti. Se ele pedir algo assim, diga isso numa frase curta e não invente.',
     'Segurança: se o Ti falar em se machucar, em não querer viver, ou em perigo imediato, responda com cuidado, pergunte diretamente se ele está seguro, e lembre que o Samaritans atende 24 horas no 116 123 no Reino Unido e o CVV no 188 no Brasil.',
   ].join('\n');
 }
 
-function segmentInstruction(pendingText) {
+function segmentInstruction(pendingText, proposalText) {
   return [
+    proposalText ? 'Evento proposto por você no turno anterior, esperando o Ti confirmar: ' + proposalText : '',
     pendingText ? 'Trechos anteriores deste turno do Ti, ainda sem resposta: "' + pendingText + '"' : 'Este é o início de um novo turno do Ti.',
     'Tarefa:',
     '1) transcript: transcreva fielmente o áudio anexado, em português do Brasil, com pontuação; use "?" quando for pergunta. Se não houver fala clara, devolva texto vazio.',
     '2) addressed_question: true somente se o áudio terminar com uma pergunta dirigida a você (Robbie), e não uma pergunta que o Ti faz a si mesmo enquanto pensa.',
     '3) urgent: true somente se o Ti expressar intenção de se machucar, de não querer viver, ou perigo imediato.',
     '4) reply: a resposta do Robbie ao turno inteiro do Ti (trechos anteriores + este áudio), seguindo as regras do sistema.',
-  ].join('\n');
+    '5) calendar_action: "propose" se o Ti pedir para criar um evento ou lembrete no calendário (preencha event: title curto, date AAAA-MM-DD, start HH:MM, end HH:MM se ele disser; use a data de hoje da agenda para entender "amanhã", "sexta" etc.); "confirm" somente se existir um evento proposto e o Ti disser claramente que sim; "cancel" se ele disser não ou desistir; senão "none".',
+  ].filter(Boolean).join('\n');
 }
 
 var RESPONSE_SCHEMA = {
   type: 'OBJECT',
-  properties: { transcript: { type: 'STRING' }, addressed_question: { type: 'BOOLEAN' }, urgent: { type: 'BOOLEAN' }, reply: { type: 'STRING' } },
-  required: ['transcript', 'addressed_question', 'urgent', 'reply'],
+  properties: { transcript: { type: 'STRING' }, addressed_question: { type: 'BOOLEAN' }, urgent: { type: 'BOOLEAN' }, reply: { type: 'STRING' },
+    calendar_action: { type: 'STRING', enum: ['none', 'propose', 'confirm', 'cancel'] },
+    event: { type: 'OBJECT', properties: { title: { type: 'STRING' }, date: { type: 'STRING' }, start: { type: 'STRING' }, end: { type: 'STRING' } } } },
+  required: ['transcript', 'addressed_question', 'urgent', 'reply', 'calendar_action'],
 };
 
 // ---------------------------------------------------------------- turn-taking (TT-01 v2, identical to the tested v3.0 logic)
@@ -342,8 +457,20 @@ function isTurnComplete(segment, addressedQuestion, firstSegment) {
   // Ti's rule (23 Nov 13:51): "a question is a question". A segment that ends with "?" gets a reply; no filters.
   // The model's addressed_question is still logged in the Turns tab for observation, but does not gate the reply.
   if (endsWithQuestion) return { complete: true, reason: addressedQuestion ? 'question-to-robbie' : 'question' };
+  if (isRequest(segment)) return { complete: true, reason: 'request' };
   return { complete: false, reason: 'no-signal' };
 }
+// v3.7 (F-2): a direct request to Robbie also gets a reply, even without "?": a request verb plus a target word, anywhere in
+// the segment (Ti's 21:41 example starts with "Faz um evento no calendário para mim..."). Thinking-aloud openings stay silent.
+var REQUEST_VERBS = /\b(faz|faca|fazer|cria|crie|criar|marca|marque|marcar|agenda|agende|agendar|lembra|lembre|lembrar|anota|anote|anotar|coloca|coloque|colocar|salva|salve|grava|grave|gravar|diz|diga|fala|fale|explica|explique|conta|conte)\b/;
+var REQUEST_TARGETS = /\b(pra mim|para mim|me|robbie|calendario|agenda|lembrete|evento|compromisso)\b/;
+var THINKING_ALOUD = /^(acho que|fiquei pensando|talvez|sera que|eu ia|eu tava pensando|eu estava pensando|tipo assim)\b/;
+function isRequest(segment) {
+  var t = normalise(segment).replace(/\?/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!t || THINKING_ALOUD.test(t)) return false;
+  return REQUEST_VERBS.test(t) && REQUEST_TARGETS.test(t);
+}
+
 function isClosing(segment) {
   var norm = normalise(segment);
   return /\btchau robbie\b/.test(norm) || /\b(pode )?encerrar( a sessao| a conversa)?\s*$/.test(norm.replace(/\?/g, '').trim());
@@ -380,7 +507,7 @@ function config_() {
 
 function tts_(cfg, text, model, voice, plain) {
   var body = {
-    contents: [{ parts: [{ text: plain ? text : 'Fale em português do Brasil, com voz natural, calorosa e calma: ' + text }] }],
+    contents: [{ parts: [{ text: plain ? text : 'Fale em português do Brasil, em ritmo natural de conversa, claro e animado: ' + text }] }],
     generationConfig: { responseModalities: ['AUDIO'],
       speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice || cfg.ttsVoice } } } },
   };
@@ -449,16 +576,17 @@ function calendarDigest_(req) {
   var cache = CacheService.getScriptCache();
   var key = 'cal_' + day.date + '_' + day.offset;
   var hit = cache.get(key);
-  if (hit) { var h = JSON.parse(hit); return { text: h.text, status: h.status + ' (cache)' }; }
+  if (hit) { var h = JSON.parse(hit); return { text: tagNow_(h.text, day.offset), status: h.status + ' (cache)' }; }
   var out;
   try {
     var events = CalendarApp.getDefaultCalendar().getEvents(day.start, day.end).slice(0, 15);
     var lines = events.map(function (e) {
       var title = String(e.getTitle() || '(sem título)').replace(/[\u0000-\u001f]/g, ' ').slice(0, 60);
       if (e.isAllDayEvent()) return '- dia inteiro: ' + title;
-      return '- ' + localHm_(e.getStartTime(), day.offset) + ' a ' + localHm_(e.getEndTime(), day.offset) + ': ' + title;
+      return '- ' + localHm_(e.getStartTime(), day.offset) + ' a ' + localHm_(e.getEndTime(), day.offset) + ': ' + title + ' {' +
+        e.getStartTime().getTime() + ',' + e.getEndTime().getTime() + '}';
     });
-    out = { text: 'Agenda de hoje do Ti (' + day.date + ', calendário principal): ' + (lines.length ? '\n' + lines.join('\n') : 'nenhum evento.'),
+    out = { text: 'Agenda de hoje do Ti (' + spokenDay_(day.date) + ', ' + day.date + ', calendário principal): ' + (lines.length ? '\n' + lines.join('\n') : 'nenhum evento.'),
       status: 'events:' + lines.length };
   } catch (err) {
     console.warn('calendar read failed: ' + err);
@@ -467,7 +595,17 @@ function calendarDigest_(req) {
       status: 'error: ' + String(err && err.message || err).slice(0, 120) };
   }
   try { cache.put(key, JSON.stringify(out), /^error/.test(out.status) ? 30 : 300); } catch (e) {} // errors cached 30 s only
-  return out;
+  return { text: tagNow_(out.text, day.offset), status: out.status };
+}
+
+// v3.7 (F-1): the current time and a past/now/later tag are added on every turn (the cached list keeps raw instants).
+function tagNow_(text, offset) {
+  var now = Date.now();
+  var tagged = String(text).replace(/ \{(\d+),(\d+)\}/g, function (_, a, b) {
+    a = Number(a); b = Number(b);
+    return b <= now ? ' [já passou]' : a <= now ? ' [em andamento]' : ' [ainda vai]';
+  });
+  return /^Agenda de hoje/.test(tagged) ? 'Agora são ' + localHm_(new Date(now), offset) + '. ' + tagged : tagged;
 }
 
 // v3.6.1: run this once from the editor (function list -> autorizarCalendario -> Run). If the calendar permission is missing,
