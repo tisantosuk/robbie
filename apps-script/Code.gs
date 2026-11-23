@@ -1,5 +1,5 @@
 /**
- * Robbie v3.7 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
+ * Robbie v3.7.1 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
  * Deploy: Execute as "Me", Who has access "Anyone".
  * Secrets live only in Script Properties (set by the one-time setup page): GEMINI_API_KEY, PASSPHRASE.
  * This file contains no keys, passphrases or spreadsheet IDs, so it can sit in a public repository.
@@ -14,6 +14,7 @@ var SHORT_LIMIT = 20;
 var LONG_LIMIT = 80;
 var PAGES_URL = 'https://tisantosuk.github.io/robbie/';
 var DEFAULT_TTS_MODEL = 'gemini-2.5-flash-preview-tts';
+var FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-3.1-flash-lite']; // conversation model when the main one is overloaded
 var DEFAULT_TTS_VOICE = 'Aoede';
 var TTS_STYLE_VERSION = 's2';
 var TTS_BACKUP_MODELS = []; // v3.7 (F-5): one voice model only, for a consistent voice; the phone voice is the fallback    // change when the TTS style text below changes
@@ -219,7 +220,36 @@ function cleanProposal_(p) {
   return e;
 }
 
-function proposalFrom_(event, day) {
+// G-5: deterministic backup for the end time when the model leaves event.end empty.
+var NUM_WORDS = { uma: 1, um: 1, duas: 2, dois: 2, tres: 3, quatro: 4, cinco: 5, seis: 6, sete: 7, oito: 8, nove: 9, dez: 10, onze: 11, doze: 12,
+  meio: 12, 'meio dia': 12, meia: 30, quinze: 15, trinta: 30, quarenta: 40, cinquenta: 50, vinte: 20 };
+function hm_(h, m) { return pad2_(h) + ':' + pad2_(m || 0); }
+function parseClock_(txt) { // "10", "10:30", "10h30", "dez", "dez e meia"
+  var m = /^(\d{1,2})(?:[:h](\d{2}))?/.exec(txt);
+  if (m) return { h: Number(m[1]), m: Number(m[2] || 0) };
+  var w = /^(meio dia|[a-z]+)(?: e (meia|quinze|trinta|quarenta|vinte))?/.exec(txt);
+  if (w && NUM_WORDS[w[1]] !== undefined && NUM_WORDS[w[1]] <= 12) return { h: NUM_WORDS[w[1]], m: w[2] ? NUM_WORDS[w[2]] : 0 };
+  return null;
+}
+function endFromTranscript_(transcript, start) {
+  var t = normalise(transcript).replace(/\?/g, ' ');
+  var sMin = Number(start.slice(0, 2)) * 60 + Number(start.slice(3, 5));
+  var dur = /\bpor (\d+|uma|um|duas|meia) (hora|horas|minuto|minutos)\b/.exec(t);
+  if (dur) {
+    var n = /^\d+$/.test(dur[1]) ? Number(dur[1]) : dur[1] === 'meia' ? 0.5 : NUM_WORDS[dur[1]];
+    var mins = /hora/.test(dur[2]) ? Math.round(n * 60) : n;
+    return { said: true, end: sMin + mins < 24 * 60 ? hm_(Math.floor((sMin + mins) / 60), (sMin + mins) % 60) : null };
+  }
+  var rng = /\b(?:das?|de) [^ ]+(?: [^ ]+)?? (?:as|a|ate as|ate) (.+)$/.exec(t) || /\bate (?:as )?(.+)$/.exec(t);
+  if (!rng) return { said: false, end: null };
+  var c = parseClock_(rng[1].trim());
+  if (!c || c.h > 23 || c.m > 59) return { said: true, end: null };
+  var e = c.h * 60 + c.m;
+  if (e <= sMin && e + 720 > sMin && e + 720 < 24 * 60) e += 720; // "das 2 às 4 da tarde"
+  return { said: true, end: e > sMin ? hm_(Math.floor(e / 60), e % 60) : null };
+}
+
+function proposalFrom_(event, day, transcript) {
   if (!event) return { error: 'missing' };
   var title = String(event.title || '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, 80);
   var date = String(event.date || ''), start = String(event.start || '').slice(0, 5), end = String(event.end || '').slice(0, 5);
@@ -227,6 +257,11 @@ function proposalFrom_(event, day) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { error: 'date' };
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(start)) return { error: 'start' };
   var toMin = function (hm) { var a = hm.split(':').map(Number); return a[0] * 60 + a[1]; };
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(end) && transcript) {
+    var fromText = endFromTranscript_(transcript, start);
+    if (fromText.end) end = fromText.end;
+    else if (fromText.said) return { error: 'end' }; // Ti said an end but it could not be read: ask, do not guess
+  }
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(end)) { var m = Math.min(toMin(start) + 30, 23 * 60 + 59); end = pad2_(Math.floor(m / 60)) + ':' + pad2_(m % 60); }
   var dur = toMin(end) - toMin(start); // end must be after start on the same day
   if (!(dur >= 5 && dur <= 240)) return { error: 'duration' };
@@ -281,7 +316,8 @@ function calendarStep_(req, proposal, action, r, transcript) {
     }
   }
   if (action === 'propose') {
-    var p = proposalFrom_(r.event, day);
+    var p = proposalFrom_(r.event, day, transcript);
+    if (p.error === 'end') return { kind: 'unclear', text: 'Ti, até que horas vai o evento?', log: 'proposal incomplete: end' };
     if (p.error) return { kind: 'unclear', text: 'Ti, me diz o dia e o horário do evento?', log: 'proposal incomplete: ' + p.error };
     return { kind: 'proposed', proposal: p.proposal, text: 'Vou criar ' + proposalSentence_(p.proposal) + ', com os 5 avisos padrão. Confirma?',
       log: 'proposed: ' + p.proposal.date + ' ' + p.proposal.start };
@@ -361,19 +397,26 @@ function analyseSegment_(cfg, audioB64, pendingText, history, agenda, proposalTe
     generationConfig: { responseMimeType: 'application/json', responseSchema: RESPONSE_SCHEMA, temperature: 0.7, maxOutputTokens: 1024 },
   };
   if (cfg.thinking) body.generationConfig.thinkingConfig = cfg.thinking;
-  var data;
+  var data, modelUsed = cfg.model;
   try { data = gemini_(cfg, body); }
-  catch (err) { // free tier: brief 500/503 "high demand" spikes; one quick retry
+  catch (err) { // free tier: brief 500/503 "high demand" spikes; one quick retry, then ONE other free model (Gemini 2319, G-1)
     if (!/Gemini (500|503)/.test(String(err.message))) throw err;
     Utilities.sleep(700);
-    data = gemini_(cfg, body);
+    try { data = gemini_(cfg, body); }
+    catch (err2) {
+      if (!/Gemini (500|503)/.test(String(err2.message))) throw err2;
+      modelUsed = FALLBACK_MODELS.filter(function (m) { return m !== cfg.model; })[0];
+      var fb = JSON.parse(JSON.stringify(body));
+      delete fb.generationConfig.thinkingConfig; // thinking settings belong to the main model
+      data = gemini_(cfg, fb, modelUsed);
+    }
   }
   var txt = ((((data.candidates || [])[0] || {}).content || {}).parts || []).map(function (p) { return p.text || ''; }).join('');
   var parsed = JSON.parse(txt);
   return { transcript: String(parsed.transcript || ''), addressed_question: Boolean(parsed.addressed_question),
     urgent: Boolean(parsed.urgent), reply: String(parsed.reply || ''),
     calendar_action: /^(propose|confirm|cancel)$/.test(String(parsed.calendar_action)) ? String(parsed.calendar_action) : 'none',
-    event: parsed.event && typeof parsed.event === 'object' ? parsed.event : null };
+    event: parsed.event && typeof parsed.event === 'object' ? parsed.event : null, model: modelUsed };
 }
 
 function gemini_(cfg, body, model) {
@@ -412,7 +455,7 @@ function segmentInstruction(pendingText, proposalText) {
     '2) addressed_question: true somente se o áudio terminar com uma pergunta dirigida a você (Robbie), e não uma pergunta que o Ti faz a si mesmo enquanto pensa.',
     '3) urgent: true somente se o Ti expressar intenção de se machucar, de não querer viver, ou perigo imediato.',
     '4) reply: a resposta do Robbie ao turno inteiro do Ti (trechos anteriores + este áudio), seguindo as regras do sistema.',
-    '5) calendar_action: "propose" se o Ti pedir para criar um evento ou lembrete no calendário (preencha event: title curto, date AAAA-MM-DD, start HH:MM, end HH:MM se ele disser; use a data de hoje da agenda para entender "amanhã", "sexta" etc.); "confirm" somente se existir um evento proposto e o Ti disser claramente que sim; "cancel" se ele disser não ou desistir; senão "none".',
+    '5) calendar_action: "propose" se o Ti pedir para criar um evento ou lembrete no calendário (preencha event: title curto, date AAAA-MM-DD, start HH:MM, end = horário de término HH:MM se o Ti disser o fim ou a duração, vazio só se ele não disser; use a data de hoje da agenda para entender "amanhã", "sexta" etc.); "confirm" somente se existir um evento proposto e o Ti disser claramente que sim; "cancel" se ele disser não ou desistir; senão "none".',
   ].filter(Boolean).join('\n');
 }
 
@@ -627,12 +670,13 @@ function logTurn_(req, out, analysis, calendarStatus) {
       'Spoke', 'Reply', 'Voice model', 'Voice fallback', 'Gemini ms', 'Voice ms', 'Phone notes']]);
   }
   if (!sh.getRange('N1').getValue()) sh.getRange('N1').setValues([['Calendar']]);
+  if (!sh.getRange('O1').getValue()) sh.getRange('O1').setValues([['Model']]);
   var a = analysis || {};
   var notes = (req.clientLog || []).slice(-10).map(function (x) { return String(x).slice(0, 200); }).join(' | ');
   var t = String(out.transcript || '');
   sh.appendRow([londonStamp_(), String(req.sessionId || '').slice(0, 40), t, /\?\s*$/.test(t), analysis ? Boolean(a.addressed_question) : '',
     String(out.reason || (out.busy ? 'busy' : out.error ? 'error' : '')), Boolean(out.speak), String(out.text || ''),
-    String(out.ttsModel || ''), String(out.ttsFallback || ''), out.geminiMs || '', out.ttsMs || '', notes, String(calendarStatus || '')]);
+    String(out.ttsModel || ''), String(out.ttsFallback || ''), out.geminiMs || '', out.ttsMs || '', notes, String(calendarStatus || ''), String((analysis && analysis.model) || '')]);
 }
 
 function greetingAudio_(cfg, text) { // cached in 90 KB chunks for 6 h, so each session does not spend a TTS request

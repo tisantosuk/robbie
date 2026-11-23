@@ -58,7 +58,7 @@ function loadVoices() {
   const all = window.speechSynthesis ? speechSynthesis.getVoices() : [];
   const br = all.filter((v) => /^pt[-_]BR/i.test(v.lang));
   state.voices = br.length ? br : all.filter((v) => /^pt/i.test(v.lang));
-  try { state.voiceIndex = Math.min(Number(localStorage.getItem('robbie_voice') || 0), Math.max(0, state.voices.length - 1)); } catch {}
+  try { localStorage.removeItem('robbie_voice'); } catch {} // v3.7.1 (G-3): the stored phone-voice choice is no longer used
 }
 if (window.speechSynthesis) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
 
@@ -67,10 +67,9 @@ function unlockSpeech() { // must run inside the start tap
     if (!state.audioCtx) state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     if (state.audioCtx.state === 'suspended') state.audioCtx.resume();
   } catch {}
-  if (!window.speechSynthesis) return;
-  speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(' '); u.volume = 0; u.lang = 'pt-BR';
-  speechSynthesis.speak(u);
+  // G-3: no dummy speak here (cancel + speak(' ') right before the greeting may leave Android's queue failing).
+  // Chrome needs only one user activation per page load for later speak() calls (sticky activation), and the tap gives it.
+  if (window.speechSynthesis) speechSynthesis.getVoices(); // warm up the engine
 }
 
 function stopPlayback() {
@@ -121,7 +120,7 @@ async function playGemini(b64, rate, format) {
 
 async function say(text, audio, rate, format) {
   if (!text) return;
-  state.speaking = true;
+  state.speaking = true; state.interrupted = false;
   if (state.vad) await state.vad.pause(); // microphone off while Robbie speaks: no self-interruption
   setMode('speaking', 'Robbie falando', 'Toque na tela para interromper.');
   $('last').textContent = 'Robbie: ' + text;
@@ -134,25 +133,32 @@ async function say(text, audio, rate, format) {
   }
 }
 
-function phoneVoice(text) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => done('timer'), 3000 + text.split(' ').length * 600); // safety: some phones skip onend
-    function done(why) { clearTimeout(timer); state.cancelSpeech = null; note('phone-voice end ' + why); resolve(); }
-    state.cancelSpeech = () => done('tap');
-    if (!window.speechSynthesis) return done('no speechSynthesis');
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = 'pt-BR';
-    if (state.voices[state.voiceIndex]) u.voice = state.voices[state.voiceIndex];
-    u.onstart = () => note('phone-voice start');
-    u.onend = () => done('ended'); u.onerror = (e) => done('error ' + (e.error || ''));
-    note('phone-voice speak voices=' + state.voices.length + ' pending=' + speechSynthesis.pending + ' speaking=' + speechSynthesis.speaking);
-    if (speechSynthesis.paused) speechSynthesis.resume();
-    speechSynthesis.speak(u);
-  });
+// G-3: Android reported "synthesis-failed". No stored voice object is passed; the queue is cleared and given 250 ms;
+// on failure one more try without lang, so Android uses its own default voice.
+async function phoneVoice(text) {
+  if (!window.speechSynthesis) { note('phone-voice: no speechSynthesis'); return; }
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    if (state.interrupted) return;
+    speechSynthesis.cancel();
+    await new Promise((ok) => setTimeout(ok, 250));
+    const result = await new Promise((resolve) => {
+      const timer = setTimeout(() => done('timer'), 3000 + text.split(' ').length * 600); // safety: some phones skip onend
+      function done(why) { clearTimeout(timer); state.cancelSpeech = null; note('phone-voice ' + attempt + ' end ' + why); resolve(why); }
+      const u = new SpeechSynthesisUtterance(text);
+      if (attempt === 1) u.lang = 'pt-BR';
+      u.onstart = () => { note('phone-voice ' + attempt + ' start'); state.cancelSpeech = () => { speechSynthesis.cancel(); done('tap'); }; };
+      u.onend = () => done('ended'); u.onerror = (e) => done('error ' + (e.error || ''));
+      note('phone-voice ' + attempt + ' speak voices=' + speechSynthesis.getVoices().length + ' pending=' + speechSynthesis.pending + ' speaking=' + speechSynthesis.speaking);
+      if (speechSynthesis.paused) speechSynthesis.resume();
+      speechSynthesis.speak(u);
+    });
+    if (!/^error/.test(result)) return;
+  }
 }
 
 document.addEventListener('click', (e) => {
-  if (state.speaking && !e.target.closest('footer')) { state.interrupted = true; stopPlayback(); } // tap anywhere to interrupt
+  // G-4: a tap interrupts only when sound is actually playing; a tap while Robbie prepares no longer mutes the reply
+  if (state.speaking && state.cancelSpeech && !e.target.closest('footer')) { state.interrupted = true; stopPlayback(); }
 });
 
 // ---------- voice in ----------
