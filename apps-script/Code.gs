@@ -122,7 +122,12 @@ function turn_(req) {
   }
 
   var t0 = Date.now();
-  var r = analyseSegment_(cfg, req.audio, pending.join(' '), history);
+  var r;
+  try { r = analyseSegment_(cfg, req.audio, pending.join(' '), history); }
+  catch (err) { // Gemini review 1703, Defect 1: a second 500/503 is not a failure on Ti's screen; the phone re-sends once
+    if (/Gemini (500|503)/.test(String(err.message))) return { busy: true, speak: false, transcript: '', pending: pending, history: history };
+    throw err;
+  }
   var geminiMs = Date.now() - t0;
   var transcript = String(r.transcript || '').trim();
   if (!transcript) return { transcript: '', speak: false, reason: 'no-speech', pending: pending, history: history, geminiMs: geminiMs };
@@ -149,8 +154,10 @@ function turn_(req) {
   history.push({ ti: full, robbie: reply });
   var out = { transcript: transcript, speak: true, reason: decision.reason, text: reply, pending: [], history: history.slice(-20), geminiMs: geminiMs };
   var t1 = Date.now();
-  var audio = ttsSafe_(cfg, reply); // V-1: same round trip; on any failure the phone uses its own voice
+  var why = {};
+  var audio = ttsSafe_(cfg, reply, why); // V-1: same round trip; on any failure the phone uses its own voice
   if (audio) { out.audio = audio.data; out.audioRate = audio.rate; out.ttsMs = Date.now() - t1; }
+  else out.ttsFallback = why.reason || 'unknown';
   return out;
 }
 
@@ -221,7 +228,13 @@ function analyseSegment_(cfg, audioB64, pendingText, history) {
     generationConfig: { responseMimeType: 'application/json', responseSchema: RESPONSE_SCHEMA, temperature: 0.7, maxOutputTokens: 1024 },
   };
   if (cfg.thinking) body.generationConfig.thinkingConfig = cfg.thinking;
-  var data = gemini_(cfg, body);
+  var data;
+  try { data = gemini_(cfg, body); }
+  catch (err) { // free tier: brief 500/503 "high demand" spikes; one quick retry
+    if (!/Gemini (500|503)/.test(String(err.message))) throw err;
+    Utilities.sleep(700);
+    data = gemini_(cfg, body);
+  }
   var txt = ((((data.candidates || [])[0] || {}).content || {}).parts || []).map(function (p) { return p.text || ''; }).join('');
   var parsed = JSON.parse(txt);
   return { transcript: String(parsed.transcript || ''), addressed_question: Boolean(parsed.addressed_question),
@@ -234,7 +247,7 @@ function gemini_(cfg, body, model) {
     payload: JSON.stringify(body), muteHttpExceptions: true,
   });
   var code = res.getResponseCode();
-  if (code !== 200) throw new Error('Gemini ' + code + ': ' + res.getContentText().slice(0, 300));
+  if (code !== 200) throw new Error('Gemini ' + code + ': ' + res.getContentText().slice(0, code === 429 ? 3000 : 300)); // 429 body names the quota (per minute or per day)
   return JSON.parse(res.getContentText());
 }
 
@@ -303,12 +316,12 @@ function isTurnComplete(segment, addressedQuestion, firstSegment) {
   var lastSentence = sentences[sentences.length - 1] || '';
   var addressed = /\b(voce|robbie)\b/.test(lastSentence);
   if (addressedQuestion && endsWithQuestion && addressed) return { complete: true, reason: 'question-to-robbie' };
-  // V-2: a whole turn that is only a short check-in question ("oi, tudo bem?"), never a self-directed one.
-  var words = plain.trim().split(' ').filter(Boolean);
-  var selfDirected = /^(por que|porque|sera que|como eu|o que eu|eu nao sei)\b/.test(plain.trim()) || /\b(eu|me|mim|meu|minha|comigo)\b/.test(plain);
-  if (firstSegment && addressedQuestion && endsWithQuestion && sentences.length === 1 && words.length <= 5 && !selfDirected) {
-    return { complete: true, reason: 'short-check-in' };
-  }
+  // V-2b (Ti, 17:06: "I ask questions and it does not answer"): the segment ends with a question that the model says is
+  // addressed to Robbie, and that last sentence is not self-directed. Thinking aloud ("por que eu fiz isso?") stays silent.
+  var rawSentences = String(segment || '').split(/(?<=[.!?…])\s+/).filter(function (x) { return x.trim(); });
+  var last = normalise(rawSentences[rawSentences.length - 1] || '').replace(/\?/g, '').trim();
+  var selfDirected = /^(por que|porque|sera que|como eu|o que eu|eu nao sei|cade)\b/.test(last) || /\b(eu|me|mim|meu|minha|meus|minhas|comigo)\b/.test(last);
+  if (addressedQuestion && endsWithQuestion && !selfDirected) return { complete: true, reason: 'question' };
   return { complete: false, reason: 'no-signal' };
 }
 function isClosing(segment) {
@@ -345,9 +358,9 @@ function config_() {
 
 // ---------------------------------------------------------------- voice (V-1: Gemini TTS on the free key, silent fallback)
 
-function tts_(cfg, text, model, voice) {
+function tts_(cfg, text, model, voice, plain) {
   var body = {
-    contents: [{ parts: [{ text: 'Fale em português do Brasil, com voz natural, calorosa e calma: ' + text }] }],
+    contents: [{ parts: [{ text: plain ? text : 'Fale em português do Brasil, com voz natural, calorosa e calma: ' + text }] }],
     generationConfig: { responseModalities: ['AUDIO'],
       speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice || cfg.ttsVoice } } } },
   };
@@ -358,17 +371,28 @@ function tts_(cfg, text, model, voice) {
   return { data: part.inlineData.data, rate: m ? Number(m[1]) : 24000, mime: part.inlineData.mimeType };
 }
 
-function ttsSafe_(cfg, text) {
-  if (!cfg.ttsOn || !text) return null;
+function ttsSafe_(cfg, text, why) {
+  why = why || {};
+  if (!cfg.ttsOn || !text) { why.reason = 'off'; return null; }
   var cache = CacheService.getScriptCache();
-  var flag = 'tts_off_' + londonStamp_().slice(0, 10);
-  if (cache.get(flag)) return null; // quota used up today: skip the slow failing call
-  try { return tts_(cfg, text); }
-  catch (err) {
-    if (/Gemini 429/.test(String(err.message))) cache.put(flag, '1', 21600);
-    console.warn('TTS fallback: ' + String(err.message).slice(0, 200));
-    return null;
+  var dayFlag = 'tts_day_' + londonStamp_().slice(0, 10); // new name: v3.2 may have set the old flag on a per-minute 429
+  if (cache.get(dayFlag)) { why.reason = 'daily quota'; return null; }   // skip the slow failing call
+  if (cache.get('tts_wait')) { why.reason = 'minute quota'; return null; }
+  for (var attempt = 0; attempt < 2; attempt++) {
+    try { return tts_(cfg, text, null, null, attempt === 1); } // 2nd try: plain text, only after "no audio"
+    catch (err) {
+      var msg = String(err.message);
+      console.warn('TTS attempt ' + (attempt + 1) + ' failed: ' + msg.slice(0, 300));
+      if (/Gemini 429/.test(msg)) {
+        if (/per[ _-]?day|daily|RPD/i.test(msg)) { cache.put(dayFlag, '1', 21600); why.reason = 'daily quota'; }
+        else { cache.put('tts_wait', '1', 30); why.reason = 'minute quota'; }
+        return null;
+      }
+      if (!/no audio/i.test(msg)) { why.reason = 'error'; return null; } // Defect 2: no retry on 400/404/5xx
+      why.reason = 'no audio';
+    }
   }
+  return null;
 }
 
 function greetingAudio_(cfg, text) { // cached in 90 KB chunks for 6 h, so each session does not spend a TTS request

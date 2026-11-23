@@ -148,9 +148,15 @@ async function processSegment(b64) {
   setMode('thinking', 'Pensando', undefined);
   const t0 = performance.now();
   try {
-    const r = await api('turn', { audio: b64, pending: state.pending, history: state.history });
+    let r = await api('turn', { audio: b64, pending: state.pending, history: state.history });
+    if (r.busy) { // Gemini briefly overloaded: one more try with the same recording
+      await new Promise((ok) => setTimeout(ok, 1500));
+      r = await api('turn', { audio: b64, pending: state.pending, history: state.history });
+      if (r.busy) { setMode('listening', 'Ouvindo', 'O Gemini está sobrecarregado agora. Pode repetir a última frase?'); return; }
+    }
     const ms = Math.round(performance.now() - t0);
-    $('timing').textContent = `Ida e volta: ${(ms / 1000).toFixed(1)} s` + (r.geminiMs ? ` (Gemini ${(r.geminiMs / 1000).toFixed(1)} s` + (r.ttsMs ? `, voz ${(r.ttsMs / 1000).toFixed(1)} s` : '') + ')' : '');
+    $('timing').textContent = `Ida e volta: ${(ms / 1000).toFixed(1)} s` + (r.geminiMs ? ` (Gemini ${(r.geminiMs / 1000).toFixed(1)} s` + (r.ttsMs ? `, voz ${(r.ttsMs / 1000).toFixed(1)} s` : '') + ')' : '') + (r.ttsFallback ? ' · voz reserva' : '');
+    if (r.ttsFallback) console.warn('Robbie voice fallback:', r.ttsFallback);
     state.pending = r.pending || [];
     state.history = r.history || state.history;
     if (r.transcript) $('last').textContent = 'Você: ' + r.transcript;
