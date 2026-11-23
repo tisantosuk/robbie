@@ -1,5 +1,5 @@
 /**
- * Robbie v3.4 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
+ * Robbie v3.5 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
  * Deploy: Execute as "Me", Who has access "Anyone".
  * Secrets live only in Script Properties (set by the one-time setup page): GEMINI_API_KEY, PASSPHRASE.
  * This file contains no keys, passphrases or spreadsheet IDs, so it can sit in a public repository.
@@ -283,6 +283,7 @@ function systemInstruction() {
     'Faça no máximo uma pergunta por resposta. Prefira perguntar a dar conselho. Não repita o que ele acabou de dizer.',
     'Humor leve e seco é bem-vindo quando o momento permite, ligado ao que ele disse. Nunca faça humor sobre sofrimento, crise ou assuntos sensíveis, a não ser que ele brinque primeiro.',
     'Não faça suposições sobre o estado ou as intenções dele; pergunte.',
+    'Você não tem acesso ao calendário, e-mail, internet ou arquivos do Ti. Se ele pedir algo assim, diga isso numa frase curta e não invente.',
     'Segurança: se o Ti falar em se machucar, em não querer viver, ou em perigo imediato, responda com cuidado, pergunte diretamente se ele está seguro, e lembre que o Samaritans atende 24 horas no 116 123 no Reino Unido e o CVV no 188 no Brasil.',
   ].join('\n');
 }
@@ -334,16 +335,9 @@ function isTurnComplete(segment, addressedQuestion, firstSegment) {
       if (finalWords.slice(-(WEAK_SIGNALS[j].length + 2)) === ' ' + WEAK_SIGNALS[j] + ' ') return { complete: true, reason: 'signal:' + WEAK_SIGNALS[j] + '?' };
     }
   }
-  var sentences = norm.split(/(?<=\?)\s/).filter(Boolean);
-  var lastSentence = sentences[sentences.length - 1] || '';
-  var addressed = /\b(voce|robbie)\b/.test(lastSentence);
-  if (addressedQuestion && endsWithQuestion && addressed) return { complete: true, reason: 'question-to-robbie' };
-  // V-2b (Ti, 17:06: "I ask questions and it does not answer"): the segment ends with a question that the model says is
-  // addressed to Robbie, and that last sentence is not self-directed. Thinking aloud ("por que eu fiz isso?") stays silent.
-  var rawSentences = String(segment || '').split(/(?<=[.!?…])\s+/).filter(function (x) { return x.trim(); });
-  var last = normalise(rawSentences[rawSentences.length - 1] || '').replace(/\?/g, '').trim();
-  var selfDirected = /^(por que|porque|sera que|como eu|o que eu|eu nao sei|cade)\b/.test(last) || /\b(eu|me|mim|meu|minha|meus|minhas|comigo)\b/.test(last);
-  if (addressedQuestion && endsWithQuestion && !selfDirected) return { complete: true, reason: 'question' };
+  // Ti's rule (23 Nov 13:51): "a question is a question". A segment that ends with "?" gets a reply; no filters.
+  // The model's addressed_question is still logged in the Turns tab for observation, but does not gate the reply.
+  if (endsWithQuestion) return { complete: true, reason: addressedQuestion ? 'question-to-robbie' : 'question' };
   return { complete: false, reason: 'no-signal' };
 }
 function isClosing(segment) {
