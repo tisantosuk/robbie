@@ -15,7 +15,8 @@ var LONG_LIMIT = 80;
 var PAGES_URL = 'https://tisantosuk.github.io/robbie/';
 var DEFAULT_TTS_MODEL = 'gemini-2.5-flash-preview-tts';
 var DEFAULT_TTS_VOICE = 'Aoede';
-var TTS_STYLE_VERSION = 's1';    // change when the TTS style text below changes
+var TTS_STYLE_VERSION = 's1';
+var TTS_BACKUP_MODELS = ['gemini-3.1-flash-tts-preview']; // each TTS model has its own free per-minute quota (3 per minute measured 23 Nov)    // change when the TTS style text below changes
 var DAILY_BENCH_LIMIT = 80;      // Claude's latency/voice measurements per London day
 var TTS_VOICES = ['Zephyr','Puck','Charon','Kore','Fenrir','Leda','Orus','Aoede','Callirrhoe','Autonoe','Enceladus','Iapetus','Umbriel','Algieba',
   'Despina','Erinome','Algenib','Rasalgethi','Laomedeia','Achernar','Alnilam','Schedar','Gacrux','Pulcherrima','Achird','Zubenelgenubi',
@@ -39,7 +40,7 @@ function doPost(e) {
   if (!passOk_(req.passphrase, props.getProperty('PASSPHRASE'))) return json_({ error: 'unauthorised' });
   try {
     switch (req.action) {
-      case 'start': return json_(start_());
+      case 'start': return json_(start_(req));
       case 'turn': return json_(turn_(req));
       case 'end': return json_(end_(req));
       case 'consult': return json_(consult_(req));
@@ -94,7 +95,7 @@ function pickModel_(names) {
 
 // ---------------------------------------------------------------- Robbie actions
 
-function start_() {
+function start_(req) {
   var cfg = config_();
   var memory = '';
   var cache = CacheService.getScriptCache();
@@ -103,14 +104,34 @@ function start_() {
     memory = String(memorySheet_(false).getSheetByName('Config').getRange('B1').getValue() || '');
     cache.put('memory_check', memory, 600);
   }
-  var greeting = 'Oi Ti, aqui é o Robbie. Como você está?';
+  var greeting = greetingText_(req && req.hour);
   var out = { greeting: greeting, memoryValue: memory, model: cfg.model };
   var audio = greetingAudio_(cfg, greeting);
-  if (audio) { out.audio = audio.data; out.audioRate = audio.rate; }
+  if (audio) { out.audio = audio.data; out.audioRate = audio.rate; out.audioFormat = audio.format; }
   return out;
 }
 
+// Ti, 23 Nov: no self-introduction each time; "Oi Ti" + time of day + a casual check-in, varied.
+var CHECK_INS = ['E aí, beleza?', 'Tudo certo?', 'Como é que tá?', 'Tudo bem?', 'Como vão as coisas?'];
+function greetingText_(hour) {
+  var h = Number(hour);
+  if (!(h >= 0 && h <= 23) || hour === null || hour === undefined || hour === '') h = Number(Utilities.formatDate(new Date(), 'Europe/London', 'H'));
+  var part = h >= 5 && h < 12 ? 'bom dia' : h >= 12 && h < 18 ? 'boa tarde' : 'boa noite';
+  return 'Oi Ti, ' + part + '. ' + CHECK_INS[Math.floor(Math.random() * CHECK_INS.length)];
+}
+
+// v3.4: every turn is written to the Turns tab of Ti's memory sheet (diagnostics; DEBUG_LOG=false turns it off).
 function turn_(req) {
+  var holder = {};
+  var out = turnCore_(req, holder);
+  // Gemini review 1053, Defect 2: analysis passed explicitly; silent segments (no speech) are not written
+  if (out.transcript || out.busy || out.error || out.closed) {
+    try { logTurn_(req, out, holder.analysis || null); } catch (e) { console.warn('turn log failed: ' + e); }
+  }
+  return out;
+}
+
+function turnCore_(req, holder) {
   var cfg = config_();
   var pending = (req.pending || []).map(String).slice(-20);
   var history = (req.history || []).slice(-20);
@@ -123,7 +144,7 @@ function turn_(req) {
 
   var t0 = Date.now();
   var r;
-  try { r = analyseSegment_(cfg, req.audio, pending.join(' '), history); }
+  try { r = analyseSegment_(cfg, req.audio, pending.join(' '), history); holder.analysis = r; }
   catch (err) { // Gemini review 1703, Defect 1: a second 500/503 is not a failure on Ti's screen; the phone re-sends once
     if (/Gemini (500|503)/.test(String(err.message))) return { busy: true, speak: false, transcript: '', pending: pending, history: history };
     throw err;
@@ -156,12 +177,13 @@ function turn_(req) {
   var t1 = Date.now();
   var why = {};
   var audio = ttsSafe_(cfg, reply, why); // V-1: same round trip; on any failure the phone uses its own voice
-  if (audio) { out.audio = audio.data; out.audioRate = audio.rate; out.ttsMs = Date.now() - t1; }
+  if (audio) { out.audio = audio.data; out.audioRate = audio.rate; out.audioFormat = audio.format; out.ttsMs = Date.now() - t1; out.ttsModel = audio.model; }
   else out.ttsFallback = why.reason || 'unknown';
   return out;
 }
 
 function end_(req) {
+  try { if (req.clientLog && req.clientLog.length) logTurn_(req, { reason: 'end:' + String(req.reason || '') }, null); } catch (e) {}
   var sh = memorySheet_(false).getSheetByName('Sessions');
   var turns = Math.max(0, Math.min(1000, Number(req.turns) || 0));
   var reason = /^(voice|button|pagehide|daily_limit)$/.test(String(req.reason)) ? String(req.reason) : 'button';
@@ -367,51 +389,73 @@ function tts_(cfg, text, model, voice, plain) {
   var data = gemini_(cfg, body, model || cfg.ttsModel);
   var part = ((((data.candidates || [])[0] || {}).content || {}).parts || []).filter(function (x) { return x.inlineData; })[0];
   if (!part) throw new Error('TTS returned no audio');
-  var m = /rate=(\d+)/.exec(part.inlineData.mimeType || '');
-  return { data: part.inlineData.data, rate: m ? Number(m[1]) : 24000, mime: part.inlineData.mimeType };
+  var mime = String(part.inlineData.mimeType || '');
+  var m = /rate=(\d+)/i.exec(mime);
+  return { data: part.inlineData.data, rate: m ? Number(m[1]) : 24000, mime: mime, format: /wav/i.test(mime) ? 'wav' : 'pcm', model: model || cfg.ttsModel };
 }
 
 function ttsSafe_(cfg, text, why) {
   why = why || {};
   if (!cfg.ttsOn || !text) { why.reason = 'off'; return null; }
   var cache = CacheService.getScriptCache();
-  var dayFlag = 'tts_day_' + londonStamp_().slice(0, 10); // new name: v3.2 may have set the old flag on a per-minute 429
-  if (cache.get(dayFlag)) { why.reason = 'daily quota'; return null; }   // skip the slow failing call
-  if (cache.get('tts_wait')) { why.reason = 'minute quota'; return null; }
-  for (var attempt = 0; attempt < 2; attempt++) {
-    try { return tts_(cfg, text, null, null, attempt === 1); } // 2nd try: plain text, only after "no audio"
-    catch (err) {
-      var msg = String(err.message);
-      console.warn('TTS attempt ' + (attempt + 1) + ' failed: ' + msg.slice(0, 300));
-      if (/Gemini 429/.test(msg)) {
-        if (/per[ _-]?day|daily|RPD/i.test(msg)) { cache.put(dayFlag, '1', 21600); why.reason = 'daily quota'; }
-        else { cache.put('tts_wait', '1', 30); why.reason = 'minute quota'; }
-        return null;
+  var day = londonStamp_().slice(0, 10);
+  var models = [cfg.ttsModel].concat(TTS_BACKUP_MODELS.filter(function (x) { return x !== cfg.ttsModel; }));
+  for (var i = 0; i < models.length; i++) {
+    var model = models[i];
+    if (cache.get('tts_day_' + day + '_' + model)) { why.reason = 'daily quota'; continue; }
+    if (cache.get('tts_wait_' + model)) { why.reason = 'minute quota'; continue; }
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try { return tts_(cfg, text, model, null, attempt === 1); } // 2nd try: plain text, only after "no audio"
+      catch (err) {
+        var msg = String(err.message);
+        console.warn('TTS ' + model + ' attempt ' + (attempt + 1) + ' failed: ' + msg.slice(0, 300));
+        if (/Gemini 429/.test(msg)) {
+          if (/per[ _-]?day|daily|RPD/i.test(msg)) { cache.put('tts_day_' + day + '_' + model, '1', 21600); why.reason = 'daily quota'; }
+          else { cache.put('tts_wait_' + model, '1', 30); why.reason = 'minute quota'; }
+          break; // next model
+        }
+        if (!/no audio/i.test(msg)) { why.reason = 'error'; break; } // no retry on 400/404/5xx; next model
+        why.reason = 'no audio';
       }
-      if (!/no audio/i.test(msg)) { why.reason = 'error'; return null; } // Defect 2: no retry on 400/404/5xx
-      why.reason = 'no audio';
     }
   }
   return null;
 }
 
+function logTurn_(req, out, analysis) {
+  if (PropertiesService.getScriptProperties().getProperty('DEBUG_LOG') === 'false') return;
+  var ss = memorySheet_(false);
+  var sh = ss.getSheetByName('Turns');
+  if (!sh) {
+    sh = ss.insertSheet('Turns');
+    sh.getRange('A1:M1').setValues([['At (London)', 'Session ID', 'Transcript', 'Ends with ?', 'Model says addressed', 'Reason',
+      'Spoke', 'Reply', 'Voice model', 'Voice fallback', 'Gemini ms', 'Voice ms', 'Phone notes']]);
+  }
+  var a = analysis || {};
+  var notes = (req.clientLog || []).slice(-10).map(function (x) { return String(x).slice(0, 200); }).join(' | ');
+  var t = String(out.transcript || '');
+  sh.appendRow([londonStamp_(), String(req.sessionId || '').slice(0, 40), t, /\?\s*$/.test(t), analysis ? Boolean(a.addressed_question) : '',
+    String(out.reason || (out.busy ? 'busy' : out.error ? 'error' : '')), Boolean(out.speak), String(out.text || ''),
+    String(out.ttsModel || ''), String(out.ttsFallback || ''), out.geminiMs || '', out.ttsMs || '', notes]);
+}
+
 function greetingAudio_(cfg, text) { // cached in 90 KB chunks for 6 h, so each session does not spend a TTS request
   if (!cfg.ttsOn) return null;
   var cache = CacheService.getScriptCache();
-  var tag = 'greet_' + TTS_STYLE_VERSION + '_' + cfg.ttsModel + '_' + cfg.ttsVoice; // Gemini note 1: new style text -> new cache
+  var tag = 'greet_' + TTS_STYLE_VERSION + '_' + cfg.ttsModel + '_' + cfg.ttsVoice + '_' + hash_(text); // one cache entry per greeting text
   var meta = cache.get(tag);
   if (meta) {
     var parts = meta.split(':'), n = Number(parts[0]), keys = [];
     for (var i = 0; i < n; i++) keys.push(tag + '_' + i);
     var got = cache.getAll(keys), data = '';
     for (var j = 0; j < n; j++) { if (!got[keys[j]]) { data = null; break; } data += got[keys[j]]; }
-    if (data) return { data: data, rate: Number(parts[1]) };
+    if (data) return { data: data, rate: Number(parts[1]), format: parts[2] || 'pcm' };
   }
   var a = ttsSafe_(cfg, text);
   if (!a) return null;
   var chunks = {}, size = 90000, count = Math.ceil(a.data.length / size);
   for (var k = 0; k < count; k++) chunks[tag + '_' + k] = a.data.slice(k * size, (k + 1) * size);
-  try { cache.putAll(chunks, 21600); cache.put(tag, count + ':' + a.rate, 21600); } catch (e) {}
+  try { cache.putAll(chunks, 21600); cache.put(tag, count + ':' + a.rate + ':' + a.format, 21600); } catch (e) {}
   return a;
 }
 
@@ -477,6 +521,7 @@ function setConfig_(req) {
   if (req.ttsModel !== undefined) { if (!/tts/.test(String(req.ttsModel))) return { error: 'not a TTS model' }; set.TTS_MODEL = String(req.ttsModel); }
   if (req.ttsVoice !== undefined) { if (TTS_VOICES.indexOf(String(req.ttsVoice)) < 0) return { error: 'unknown voice' }; set.TTS_VOICE = String(req.ttsVoice); }
   if (req.ttsEnabled !== undefined) set.TTS_ENABLED = req.ttsEnabled ? 'true' : 'false';
+  if (req.debugLog !== undefined) set.DEBUG_LOG = req.debugLog ? 'true' : 'false';
   p.setProperties(set);
   var now = config_();
   return { model: now.model, thinking: now.thinking, ttsOn: now.ttsOn, ttsModel: now.ttsModel, ttsVoice: now.ttsVoice };
@@ -521,6 +566,8 @@ function modelNames_(data) {
     .map(function (m) { return String(m.name || '').replace(/^models\//, ''); })
     .filter(function (n) { return /flash/.test(n); });
 }
+
+function hash_(t) { var h = 0; t = String(t); for (var i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
 
 function londonStamp_() { return Utilities.formatDate(new Date(), 'Europe/London', 'yyyy-MM-dd HH:mm'); }
 
