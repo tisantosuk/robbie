@@ -1,5 +1,5 @@
 /**
- * Robbie v3.6 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
+ * Robbie v3.6.1 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
  * Deploy: Execute as "Me", Who has access "Anyone".
  * Secrets live only in Script Properties (set by the one-time setup page): GEMINI_API_KEY, PASSPHRASE.
  * This file contains no keys, passphrases or spreadsheet IDs, so it can sit in a public repository.
@@ -48,6 +48,7 @@ function doPost(e) {
       case 'bench': return json_(bench_(req));       // Claude: measure one model setting on a recording
       case 'tts_test': return json_(ttsTest_(req));  // Claude: measure one voice setting
       case 'set_config': return json_(setConfig_(req)); // Claude: apply the agreed model/voice settings
+      case 'diag': return json_({ calendar: calendarDigest_(req).status }); // Claude: calendar status, no event data
       default: return json_({ error: 'unknown action' });
     }
   } catch (err) {
@@ -461,10 +462,21 @@ function calendarDigest_(req) {
       status: 'events:' + lines.length };
   } catch (err) {
     console.warn('calendar read failed: ' + err);
-    out = { text: 'Agenda de hoje do Ti: indisponível agora (erro de leitura). Se ele perguntar, diga que não conseguiu ler a agenda.', status: 'error' };
+    // v3.6.1: the error text goes to column N, so Claude can read the cause from the sheet
+    out = { text: 'Agenda de hoje do Ti: indisponível agora (erro de leitura). Se ele perguntar, diga que não conseguiu ler a agenda.',
+      status: 'error: ' + String(err && err.message || err).slice(0, 120) };
   }
-  try { cache.put(key, JSON.stringify(out), 300); } catch (e) {}
+  try { cache.put(key, JSON.stringify(out), /^error/.test(out.status) ? 30 : 300); } catch (e) {} // errors cached 30 s only
   return out;
+}
+
+// v3.6.1: run this once from the editor (function list -> autorizarCalendario -> Run). If the calendar permission is missing,
+// Google shows the authorisation screen; otherwise the log shows "Calendário OK" or the exact error. Read-only.
+function autorizarCalendario() {
+  var cal = CalendarApp.getDefaultCalendar();
+  var n = cal.getEvents(new Date(), new Date(Date.now() + 86400000)).length;
+  console.log('Calendário OK: ' + cal.getName() + '. Eventos nas próximas 24 horas: ' + n);
+  return n;
 }
 
 function logTurn_(req, out, analysis, calendarStatus) {
