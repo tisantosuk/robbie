@@ -1,5 +1,5 @@
 /**
- * Robbie v3.8 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
+ * Robbie v3.9 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
  * Deploy: Execute as "Me", Who has access "Anyone".
  * Secrets live only in Script Properties (set by the one-time setup page): GEMINI_API_KEY, PASSPHRASE.
  * This file contains no keys, passphrases or spreadsheet IDs, so it can sit in a public repository.
@@ -173,6 +173,15 @@ function turnCore_(req, holder) {
   var action = String(r.calendar_action || 'none');
   var partialIn = req.partial && typeof req.partial === 'object' ? req.partial : null;
   if (partialIn && action === 'none' && transcript) action = 'propose'; // H-4b: the next segment completes the request
+  // v3.9 (K-1, K-2): Ti answering Robbie's own question, right after it was asked (first segment, within 90 s)
+  var lastRobbie = history.length ? String(history[history.length - 1].robbie || '') : '';
+  var lastTi = history.length ? String(history[history.length - 1].ti || '') : '';
+  var since = Number(req.secondsSinceRobbie);
+  var answering = pending.length === 0 && /\?\s*$/.test(lastRobbie) && since >= 0 && since <= 90 && isAnswer_(transcript);
+  if (answering && action === 'none' && !proposal && !partialIn && isYes_(transcript)) {
+    var offered = offerFrom_(lastRobbie, lastTi, phoneDay_(req).date);
+    if (offered) { action = 'propose'; r.event = offered; } // K-2: "Quer que eu anote um lembrete...?" -> "Quero sim" -> propose
+  }
   if (proposal || action === 'propose') {
     var ev = calendarStep_(req, proposal, action, r, transcript);
     if (ev) {
@@ -186,6 +195,7 @@ function turnCore_(req, holder) {
   var firstSegment = pending.length === 0;
   pending.push(transcript);
   var decision = r.urgent ? { complete: true, reason: 'urgent' } : isTurnComplete(transcript, r.addressed_question, firstSegment);
+  if (!decision.complete && answering) decision = { complete: true, reason: 'answer' };
   if (!decision.complete) return { transcript: transcript, speak: false, reason: decision.reason, pending: pending, history: history, geminiMs: geminiMs };
 
   var full = pending.join(' ');
@@ -224,6 +234,19 @@ function partialFrom_(ev, transcript, earlier, today) { // what Ti has said so f
   if (p.date && today) p.date = normaliseDate_(p.date, today) || p.date;
   p.said = (String((earlier || {}).said || '') + ' ' + transcript).trim().slice(-300);
   return p;
+}
+
+var ANSWER_WORDS = /^(sim|nao|quero|pode|claro|isso|ok|okay|beleza|com certeza|tambem|talvez|acho que sim|acho que nao|prefiro|bora|vamos)\b/;
+function isAnswer_(t) { var n = normalise(t).replace(/\?/g, ' ').trim(); return n.split(' ').filter(Boolean).length <= 6 || ANSWER_WORDS.test(n); }
+function isYes_(t) { var n = normalise(t).replace(/\?/g, ' ').trim(); return /^(sim|quero|pode|claro|isso|ok|okay|beleza|com certeza|bora|vamos|por favor)\b/.test(n) && !/\bnao\b/.test(n); }
+// K-2: Robbie offered a reminder or event in his last reply; build the draft from the offer (the server asks for what is missing).
+var OFFER = /quer que eu (?:anote|crie|marque|agende|coloque|faca|faça)(?: um| uma)? (?:lembrete|evento|compromisso)(?: (?:para|pra) (?:voce|você))?(?: (?:para|pra|de))? ?([^?]*)\?/i;
+function offerFrom_(lastRobbie, lastTi, today) {
+  var m = OFFER.exec(lastRobbie);
+  if (!m) return null;
+  var what = String(m[1] || '').replace(/(^|\s)(depois de amanhã|depois de amanha|amanhã|amanha|hoje)(?=\s|$)/gi, ' ').replace(/\s+/g, ' ').trim();
+  var title = what ? what.charAt(0).toUpperCase() + what.slice(1) : 'Lembrete';
+  return { title: title.slice(0, 80), date: normaliseDate_(lastRobbie, today) || normaliseDate_(lastTi, today) || '' };
 }
 
 function cleanProposal_(p) {
@@ -368,6 +391,8 @@ function calendarStep_(req, proposal, action, r, transcript) {
     var partial = partialFrom_(ev0, transcript, req.partial, day.date);
     if (p.error === 'end') return { kind: 'unclear', partial: partial, text: 'Até que horas vai o evento?', log: 'proposal incomplete: end' };
     if (p.error === 'title') return { kind: 'unclear', partial: partial, text: 'Qual é o assunto do evento?', log: 'proposal incomplete: title' };
+    if (p.error === 'start') return { kind: 'unclear', partial: partial, text: 'Que horas eu marco?', log: 'proposal incomplete: start' };
+    if (p.error === 'date') return { kind: 'unclear', partial: partial, text: 'Pra que dia eu marco?', log: 'proposal incomplete: date' };
     if (p.error) return { kind: 'unclear', partial: partial, text: 'Me diz o dia e o horário do evento?', log: 'proposal incomplete: ' + p.error };
     return { kind: 'proposed', proposal: p.proposal, text: 'Vou criar ' + proposalSentence_(p.proposal) + ', com os 5 avisos padrão. Confirma?',
       log: 'proposed: ' + p.proposal.date + ' ' + p.proposal.start };
@@ -488,6 +513,8 @@ function systemInstruction() {
     'Não comece as respostas com o nome dele e quase não use "Ti": no máximo uma vez a cada várias respostas, só quando soar natural.',
     'Por padrão, responda com uma única frase de no máximo ' + SHORT_LIMIT + ' palavras. Só quando o Ti pedir explicação ("explica", "fala mais", "por quê?") use até ' + LONG_LIMIT + ' palavras.',
     'Faça no máximo uma pergunta por resposta. Prefira perguntar a dar conselho. Não repita o que ele acabou de dizer.',
+    'Quando o Ti contar uma decisão ou dúvida (cancelar, mudar, desistir, trocar), primeiro pergunte o motivo, numa pergunta curta; só dê opinião depois que ele explicar, ou se ele pedir de novo.',
+    'Não sugira que ele descanse, pare ou fique em casa, a não ser que ele mesmo fale em descansar.',
     'Humor leve e seco é bem-vindo quando o momento permite, ligado ao que ele disse. Nunca faça humor sobre sofrimento, crise ou assuntos sensíveis, a não ser que ele brinque primeiro.',
     'Não faça suposições sobre o estado ou as intenções dele; pergunte.',
     'Você vê a agenda de HOJE e de AMANHÃ do calendário principal do Ti (conta tisantos.uk@gmail.com), quando ela vier na mensagem, com a hora atual. Use os horários exatos; eventos marcados [já passou] você fala no passado; não invente eventos.',
@@ -506,7 +533,7 @@ function segmentInstruction(pendingText, proposalText) {
     '2) addressed_question: true somente se o áudio terminar com uma pergunta dirigida a você (Robbie), e não uma pergunta que o Ti faz a si mesmo enquanto pensa.',
     '3) urgent: true somente se o Ti expressar intenção de se machucar, de não querer viver, ou perigo imediato.',
     '4) reply: a resposta do Robbie ao turno inteiro do Ti (trechos anteriores + este áudio), seguindo as regras do sistema.',
-    '5) calendar_action: "propose" se o Ti pedir para criar um evento ou lembrete no calendário (preencha event: title curto, date AAAA-MM-DD, start HH:MM, end = horário de término HH:MM se o Ti disser o fim ou a duração, vazio só se ele não disser; use a data de hoje da agenda para entender "amanhã", "sexta" etc.); "confirm" somente se existir um evento proposto e o Ti disser claramente que sim; "cancel" se ele disser não ou desistir; senão "none".',
+    '5) calendar_action: "propose" se o Ti pedir para criar um evento ou lembrete no calendário, MESMO sem horário ou data (o servidor pergunta o que faltar; não ofereça, proponha) (preencha event: title curto, date AAAA-MM-DD, start HH:MM, end = horário de término HH:MM se o Ti disser o fim ou a duração, vazio só se ele não disser; use a data de hoje da agenda para entender "amanhã", "sexta" etc.); "confirm" somente se existir um evento proposto e o Ti disser claramente que sim; "cancel" se ele disser não ou desistir; senão "none".',
   ].filter(Boolean).join('\n');
 }
 
@@ -643,7 +670,7 @@ function ttsSafe_(cfg, text, why) {
     if (cache.get('tts_day_' + day + '_' + model)) { why.reason = 'daily quota'; continue; }
     if (cache.get('tts_wait_' + model)) { why.reason = 'minute quota'; break; } // short pause; no switching mid-conversation
     for (var attempt = 0; attempt < 2; attempt++) {
-      try { var a = tts_(cfg, text, model, null, attempt === 1); a.backup = isBackup; return a; } // 2nd try: plain text, only after "no audio"
+      try { var a = tts_(cfg, text, model, null, isBackup || attempt === 1); a.backup = isBackup; return a; } // backup model: plain text (K-4); main: 2nd try plain
       catch (err) {
         var msg = String(err.message);
         console.warn('TTS ' + model + ' attempt ' + (attempt + 1) + ' failed: ' + msg.slice(0, 300));
@@ -772,6 +799,7 @@ function greetingAudio_(cfg, text) { // cached in 90 KB chunks for 6 h, so each 
   var why = {};
   var a = ttsSafe_(cfg, text, why);
   if (!a) return { failed: true, why: why };
+  if (a.backup) return a; // K-4: a greeting from the backup model is not cached
   var chunks = {}, size = 90000, count = Math.ceil(a.data.length / size);
   for (var k = 0; k < count; k++) chunks[tag + '_' + k] = a.data.slice(k * size, (k + 1) * size);
   try { cache.putAll(chunks, 21600); cache.put(tag, count + ':' + a.rate + ':' + a.format, 21600); } catch (e) {}

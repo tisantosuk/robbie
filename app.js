@@ -8,7 +8,7 @@ const MAX_SEGMENT_S = 30;
 const state = {
   cfg: null, sessionId: null, vad: null, speaking: false, closed: true,
   queue: Promise.resolve(), wakeLock: null, pending: [], history: [], turns: 0,
-  voices: [], voiceIndex: 0, cancelSpeech: null, audioCtx: null, clientLog: [], proposal: null, partial: null,
+  voices: [], voiceIndex: 0, cancelSpeech: null, audioCtx: null, clientLog: [], proposal: null, partial: null, lastSpokeAt: 0,
 };
 
 function phoneDay() { // Increment 1: Robbie's "today" is the phone's own day (Ti travels between England and Brazil)
@@ -128,7 +128,7 @@ async function say(text, audio, rate, format) {
     const played = audio ? await playGemini(audio, rate, format) : false;
     if (!played && !state.interrupted) await phoneVoice(text);
   } finally {
-    state.speaking = false; state.interrupted = false;
+    state.speaking = false; state.interrupted = false; state.lastSpokeAt = Date.now(); // K-1: answers to Robbie's question
     if (!state.closed && state.vad) { await state.vad.start(); setMode('listening', 'Ouvindo', 'Quando terminar, diga "o que você acha?" ou "sua vez".'); }
   }
 }
@@ -197,10 +197,10 @@ async function processSegment(b64) {
   setMode('thinking', 'Pensando', undefined);
   const t0 = performance.now();
   try {
-    let r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), proposal: state.proposal, partial: state.partial, ...phoneDay() });
+    let r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), proposal: state.proposal, partial: state.partial, secondsSinceRobbie: state.lastSpokeAt ? Math.round((Date.now() - state.lastSpokeAt) / 1000) : -1, ...phoneDay() });
     if (r.busy) { // Gemini briefly overloaded: one more try with the same recording
       await new Promise((ok) => setTimeout(ok, 1500));
-      r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), proposal: state.proposal, partial: state.partial, ...phoneDay() });
+      r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), proposal: state.proposal, partial: state.partial, secondsSinceRobbie: state.lastSpokeAt ? Math.round((Date.now() - state.lastSpokeAt) / 1000) : -1, ...phoneDay() });
       if (r.busy) { setMode('listening', 'Ouvindo', 'O Gemini está sobrecarregado agora. Pode repetir a última frase?'); return; }
     }
     const ms = Math.round(performance.now() - t0);
