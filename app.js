@@ -8,7 +8,7 @@ const MAX_SEGMENT_S = 30;
 const state = {
   cfg: null, sessionId: null, vad: null, speaking: false, closed: true,
   queue: Promise.resolve(), wakeLock: null, pending: [], history: [], turns: 0,
-  voices: [], voiceIndex: 0, cancelSpeech: null, audioCtx: null, clientLog: [], proposal: null,
+  voices: [], voiceIndex: 0, cancelSpeech: null, audioCtx: null, clientLog: [], proposal: null, partial: null,
 };
 
 function phoneDay() { // Increment 1: Robbie's "today" is the phone's own day (Ti travels between England and Brazil)
@@ -197,10 +197,10 @@ async function processSegment(b64) {
   setMode('thinking', 'Pensando', undefined);
   const t0 = performance.now();
   try {
-    let r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), proposal: state.proposal, ...phoneDay() });
+    let r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), proposal: state.proposal, partial: state.partial, ...phoneDay() });
     if (r.busy) { // Gemini briefly overloaded: one more try with the same recording
       await new Promise((ok) => setTimeout(ok, 1500));
-      r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), proposal: state.proposal, ...phoneDay() });
+      r = await api('turn', { audio: b64, pending: state.pending, history: state.history, sessionId: state.sessionId, clientLog: takeNotes(), proposal: state.proposal, partial: state.partial, ...phoneDay() });
       if (r.busy) { setMode('listening', 'Ouvindo', 'O Gemini está sobrecarregado agora. Pode repetir a última frase?'); return; }
     }
     const ms = Math.round(performance.now() - t0);
@@ -208,6 +208,7 @@ async function processSegment(b64) {
     if (r.ttsFallback) console.warn('Robbie voice fallback:', r.ttsFallback);
     state.pending = r.pending || [];
     if ('proposal' in r) state.proposal = r.proposal; // Increment 1b: event waiting for Ti's yes (held on the phone)
+    state.partial = r.partial || null; // v3.8 (H-4b): an incomplete request is kept for one turn only
     state.history = r.history || state.history;
     if (r.transcript) $('last').textContent = 'Você: ' + r.transcript;
     if (r.closed) state.closed = true; // keep the microphone off after the goodbye
@@ -248,7 +249,7 @@ $('start').addEventListener('click', async () => {
     const s = await api('start', { hour: new Date().getHours() }); // greeting by the phone's own time of day
     $('timing').textContent = `Início: ${((performance.now() - t0) / 1000).toFixed(1)} s`;
     state.sessionId = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now());
-    state.pending = []; state.history = []; state.turns = 0; state.closed = false; state.proposal = null;
+    state.pending = []; state.history = []; state.turns = 0; state.closed = false; state.proposal = null; state.partial = null;
     $('memory').textContent = s.memoryValue ? 'Memória: ' + s.memoryValue : '';
     $('controls').classList.remove('hidden');
     await say(s.greeting, s.audio, s.audioRate, s.audioFormat);
