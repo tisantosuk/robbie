@@ -133,22 +133,36 @@ async function say(text, audio, rate, format) {
   }
 }
 
-// G-3: Android reported "synthesis-failed". No stored voice object is passed; the queue is cleared and given 250 ms;
-// on failure one more try without lang, so Android uses its own default voice.
+// P-1 (Gemini 2342): Android reports "synthesis-failed" when Chrome picks a voice by lang alone (90 voices on Ti's phone).
+// Attempt 1: an on-device Portuguese voice; 2: any Portuguese voice; 3: no voice and no lang. Each attempt logs the voice.
+// The microphone is already released while Robbie speaks: vad-web 0.0.31 pause() stops the tracks (default pauseStream).
+function ptVoices() {
+  const all = speechSynthesis.getVoices();
+  const pt = all.filter((v) => /^pt/i.test(v.lang));
+  const rank = (v) => (/^pt[-_]BR/i.test(v.lang) ? 0 : 1);
+  pt.sort((x, y) => rank(x) - rank(y));
+  return { all, local: pt.filter((v) => v.localService), any: pt };
+}
+
 async function phoneVoice(text) {
   if (!window.speechSynthesis) { note('phone-voice: no speechSynthesis'); return; }
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  const v = ptVoices();
+  const plans = [v.local[0] || null, v.any.find((x) => x !== v.local[0]) || null, 'none'];
+  for (let attempt = 1; attempt <= 3; attempt++) {
     if (state.interrupted) return;
+    const voice = plans[attempt - 1];
+    if (voice === null) { note('phone-voice ' + attempt + ' skipped (no such voice)'); continue; }
     speechSynthesis.cancel();
     await new Promise((ok) => setTimeout(ok, 250));
     const result = await new Promise((resolve) => {
       const timer = setTimeout(() => done('timer'), 3000 + text.split(' ').length * 600); // safety: some phones skip onend
       function done(why) { clearTimeout(timer); state.cancelSpeech = null; note('phone-voice ' + attempt + ' end ' + why); resolve(why); }
       const u = new SpeechSynthesisUtterance(text);
-      if (attempt === 1) u.lang = 'pt-BR';
+      if (voice !== 'none') { u.voice = voice; u.lang = voice.lang; }
       u.onstart = () => { note('phone-voice ' + attempt + ' start'); state.cancelSpeech = () => { speechSynthesis.cancel(); done('tap'); }; };
       u.onend = () => done('ended'); u.onerror = (e) => done('error ' + (e.error || ''));
-      note('phone-voice ' + attempt + ' speak voices=' + speechSynthesis.getVoices().length + ' pending=' + speechSynthesis.pending + ' speaking=' + speechSynthesis.speaking);
+      note('phone-voice ' + attempt + ' speak voice=' + (voice === 'none' ? 'default' : voice.name + ' ' + voice.lang + ' local=' + voice.localService) +
+        ' voices=' + v.all.length + ' pt=' + v.any.length + ' ptLocal=' + v.local.length);
       if (speechSynthesis.paused) speechSynthesis.resume();
       speechSynthesis.speak(u);
     });
