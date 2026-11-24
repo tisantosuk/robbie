@@ -1,5 +1,5 @@
 /**
- * Robbie v3.10 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
+ * Robbie v3.11 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
  * Deploy: Execute as "Me", Who has access "Anyone".
  * Secrets live only in Script Properties (set by the one-time setup page): GEMINI_API_KEY, PASSPHRASE.
  * This file contains no keys, passphrases or spreadsheet IDs, so it can sit in a public repository.
@@ -224,13 +224,27 @@ function withVoice_(cfg, out) {
 
 var DEFAULT_REMINDERS = [10080, 1440, 180, 60, 30]; // Ti's rule: 1 week, 1 day, 3 h, 1 h, 30 min before (popup)
 var DAILY_EVENT_LIMIT = 10;
-var YES_WORDS = /\b(sim|pode|confirma|confirmo|isso|claro|ok|beleza|fechado|pode gravar|grava|manda)\b/;
+// v3.11 (N-1): yes words by stem at the start ("Confirmam", "Gravar", "Pode sim"); "não", "mas" or a bare "confirma?" is not a yes.
+var YES_START = /^(?:(?:e|ah|entao|bom|ta)\s+)?(sim|pode|confirm[a-z]*|isso|claro|ok|okay|beleza|fechado|fechou|grav[a-z]*|manda|bora|vamos|com certeza|por favor|perfeito|certo|exato|ta bom|ta certo|ta otimo|otimo|show|demorou)\b/;
+function isConfirm_(t) {
+  var n = normalise(t).trim();
+  if (!n || /\b(nao|mas|porem)\b/.test(n)) return false;
+  if (/^confirm[a-z]*\s*\?\s*$/.test(n)) return false; // Ti asking back "Confirma?"
+  return YES_START.test(n.replace(/\?/g, ' ').trim());
+}
+// v3.11 (N-2, N-4): while a proposal waits, a change of title, day, time, end or duration updates it instead of discarding it.
+var CORRECTION = /\b(assunto|titulo|nome|chama|muda[a-z]*|mude|troca[a-z]*|troque|corrig[a-z]*|na verdade|ate as|ate a|vai ate|dura[a-z]*|termina[a-z]*|acaba[a-z]*|comeca[a-z]*|horario|hora|horas|dia|amanha|hoje|segunda|terca|quarta|quinta|sexta|sabado|domingo|faltou)\b|\d/;
+var GIVE_UP = /\b(deixa|esquece|desisti[a-z]*|cancela[a-z]*|nao precisa|nao quero|para com)\b/;
+// v3.11 (N-2): a title that is only a generic word counts as missing, so the server asks for the subject.
+var GENERIC_TITLE = /^(?:(?:um|uma|o|a|meu|minha)\s+)?(lembrete|evento|compromisso|reuniao|tarefa|algo|alguma coisa|coisa|nota|aviso|agenda|marcacao|item)(?:\s+(?:para|pra|de|no|na)\s+(?:hoje|amanha|depois de amanha|calendario|agenda))?$/;
+function isGenericTitle_(t) { return GENERIC_TITLE.test(normalise(t).replace(/\?/g, ' ').trim()); }
 var WEEKDAYS = ['domingo', 'segunda', 'terça', 'quarta', 'quinta', 'sexta', 'sábado'];
 
 function stripEmpty_(o) { var out = {}; Object.keys(o).forEach(function (k) { if (o[k] !== '' && o[k] !== null && o[k] !== undefined) out[k] = o[k]; }); return out; }
 function partialFrom_(ev, transcript, earlier, today) { // what Ti has said so far, kept on the phone for ONE turn
   var p = {};
   ['title', 'date', 'start', 'end'].forEach(function (k) { if (ev[k]) p[k] = String(ev[k]).slice(0, 80); });
+  if (p.title && isGenericTitle_(p.title)) delete p.title; // N-2: "Lembrete" is not a subject
   if (p.date && today) p.date = normaliseDate_(p.date, today) || p.date;
   p.said = (String((earlier || {}).said || '') + ' ' + transcript).trim().slice(-300);
   return p;
@@ -273,7 +287,7 @@ function parseClock_(txt) { // "10", "10:30", "10h30", "dez", "dez e meia"
 function endFromTranscript_(transcript, start) {
   var t = normalise(transcript).replace(/\?/g, ' ');
   var sMin = Number(start.slice(0, 2)) * 60 + Number(start.slice(3, 5));
-  var dur = /\bpor (\d+|uma|um|duas|meia) (hora|horas|minuto|minutos)\b/.exec(t);
+  var dur = /\b(?:por|dura|durar|duram|durando|leva|levar) (?:umas? |cerca de |uns )?(\d+|uma|um|duas|dois|tres|quatro|meia) (hora|horas|minuto|minutos)\b/.exec(t); // N-4: "dura 2 horas"
   if (dur) {
     var n = /^\d+$/.test(dur[1]) ? Number(dur[1]) : dur[1] === 'meia' ? 0.5 : NUM_WORDS[dur[1]];
     var mins = /hora/.test(dur[2]) ? Math.round(n * 60) : n;
@@ -322,7 +336,7 @@ function proposalFrom_(event, day, transcript) {
   var date = normaliseDate_(event.date, day.date) || (transcript ? normaliseDate_(transcript, day.date) : '');
   var start = String(event.start || '').slice(0, 5), end = String(event.end || '').slice(0, 5);
   if (/^\d:\d\d$/.test(String(event.start || ''))) start = '0' + String(event.start).slice(0, 4);
-  if (!title) return { error: 'title' };
+  if (!title || isGenericTitle_(title)) return { error: 'title' }; // N-2
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { error: 'date' };
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(start)) return { error: 'start' };
   var toMin = function (hm) { var a = hm.split(':').map(Number); return a[0] * 60 + a[1]; };
@@ -343,6 +357,7 @@ function proposalFrom_(event, day, transcript) {
 
 function addDays_(date, n) { var p = ymd_(date); var d = new Date(Date.UTC(p[0], p[1], p[2]) + n * 86400000); return d.getUTCFullYear() + '-' + pad2_(d.getUTCMonth() + 1) + '-' + pad2_(d.getUTCDate()); }
 function pad2_(n) { return (n < 10 ? '0' : '') + n; }
+function toMin_(hm) { var a = String(hm).split(':').map(Number); return a[0] * 60 + a[1]; }
 function ymd_(d) { var p = d.split('-').map(Number); return [p[0], p[1] - 1, p[2]]; }
 
 function proposalSentence_(e) { return '"' + e.title + '", ' + spokenDay_(e.date) + ', das ' + e.start + ' às ' + e.end; }
@@ -360,7 +375,9 @@ function isoLocal_(date, hm, offset) { // offset = Date.getTimezoneOffset minute
 function calendarStep_(req, proposal, action, r, transcript) {
   var day = phoneDay_(req);
   var plain = normalise(transcript);
-  if (proposal && action === 'confirm' && YES_WORDS.test(plain)) {
+  // v3.11 (N-1): a clear spoken yes confirms even when the model did not label it "confirm"; a new "propose" or "cancel" wins.
+  // Without the model's "confirm", the yes must also be short (6 words or fewer), so "Isso é importante pra mim..." is not a yes.
+  if (proposal && action !== 'propose' && action !== 'cancel' && isConfirm_(transcript) && (action === 'confirm' || plain.split(' ').filter(Boolean).length <= 6)) {
     var cache = CacheService.getScriptCache();
     if (cache.get('created_' + proposal.hash)) {
       return { kind: 'duplicate', text: 'Esse evento já está no calendário.', log: 'duplicate: ' + proposal.title };
@@ -385,8 +402,22 @@ function calendarStep_(req, proposal, action, r, transcript) {
       return { kind: 'error', text: 'Não consegui gravar no calendário agora.', log: 'create error: ' + String(err && err.message || err).slice(0, 100) };
     }
   }
+  // v3.11 (N-2, N-4): with a proposal waiting, a correction ("o assunto é...", "vai até as 11", "dura 2 horas") updates it.
+  if (proposal && (action === 'none' || action === 'cancel') && CORRECTION.test(plain) && !GIVE_UP.test(plain)) action = 'propose';
   if (action === 'propose') {
-    var ev0 = Object.assign({}, req.partial || {}, stripEmpty_(r.event || {})); // H-4b: complete an earlier partial request
+    var changes = stripEmpty_(r.event || {});
+    var ev0 = Object.assign({}, req.partial || {}, changes); // H-4b: complete an earlier partial request
+    if (proposal) {
+      var base = { title: proposal.title, date: proposal.date, start: proposal.start, end: proposal.end };
+      if (changes.title && isGenericTitle_(changes.title)) delete changes.title; // do not overwrite a real subject with "Lembrete"
+      ev0 = Object.assign(base, changes);
+      if (changes.start && !changes.end && changes.start !== proposal.start && /^\d{2}:\d{2}$/.test(String(changes.start).slice(0, 5))) {
+        var len = toMin_(proposal.end) - toMin_(proposal.start), ns = toMin_(String(changes.start).slice(0, 5)) + len; // keep the length
+        ev0.end = ns < 24 * 60 ? hm_(Math.floor(ns / 60), ns % 60) : '';
+      }
+      var spokenEnd = /^\d{2}:\d{2}$/.test(String(ev0.start).slice(0, 5)) ? endFromTranscript_(transcript, String(ev0.start).slice(0, 5)) : { end: null };
+      if (spokenEnd.end && !changes.end) ev0.end = spokenEnd.end;
+    }
     var p = proposalFrom_(ev0, day, transcript + ' ' + String((req.partial || {}).said || ''));
     var partial = partialFrom_(ev0, transcript, req.partial, day.date);
     if (p.error === 'end') return { kind: 'unclear', partial: partial, text: 'Até que horas vai o evento?', log: 'proposal incomplete: end' };
@@ -394,8 +425,11 @@ function calendarStep_(req, proposal, action, r, transcript) {
     if (p.error === 'start') return { kind: 'unclear', partial: partial, text: 'Que horas eu marco?', log: 'proposal incomplete: start' };
     if (p.error === 'date') return { kind: 'unclear', partial: partial, text: 'Pra que dia eu marco?', log: 'proposal incomplete: date' };
     if (p.error) return { kind: 'unclear', partial: partial, text: 'Me diz o dia e o horário do evento?', log: 'proposal incomplete: ' + p.error };
-    return { kind: 'proposed', proposal: p.proposal, text: 'Vou criar ' + proposalSentence_(p.proposal) + ', com os 5 avisos padrão. Confirma?',
-      log: 'proposed: ' + p.proposal.date + ' ' + p.proposal.start };
+    if (proposal && p.proposal.hash === proposal.hash) { // a correction the server could not read: keep the proposal and ask
+      return { kind: 'unclear', proposal: proposal, text: 'O que eu mudo no evento?', log: 'correction unread' };
+    }
+    return { kind: 'proposed', proposal: p.proposal, text: (proposal ? 'Corrigi. ' : '') + 'Vou criar ' + proposalSentence_(p.proposal) + ', com os 5 avisos padrão. Confirma?',
+      log: (proposal ? 'updated: ' : 'proposed: ') + p.proposal.date + ' ' + p.proposal.start + '-' + p.proposal.end };
   }
   if (proposal) { // anything other than a clear yes or a new proposal discards it (Gemini 1831, D-2)
     if (action === 'cancel') return { kind: 'cancelled', text: 'Tá bom, não criei.', log: 'cancelled' };
@@ -520,7 +554,7 @@ function systemInstruction() {
     'Não faça suposições sobre o estado ou as intenções dele; pergunte.',
     'Você vê a agenda de HOJE e de AMANHÃ do calendário principal do Ti (conta tisantos.uk@gmail.com), quando ela vier na mensagem, com a hora atual. Use os horários exatos; eventos marcados [já passou] você fala no passado; não invente eventos.',
     'Você pode CRIAR um evento novo no calendário principal quando o Ti pedir: você repete o pedido e só grava depois que ele confirmar. Você não muda nem apaga eventos.',
-    'Você não vê depois de amanhã nem outros dias, outras contas, e-mail, internet ou arquivos do Ti. Se ele pedir algo assim, diga isso numa frase curta e não invente.',
+    'Você não vê depois de amanhã nem outros dias, outras contas, e-mail, internet ou arquivos do Ti. Se ele perguntar de um dia que não está na agenda, diga "Esse dia eu ainda não consigo ver"; não diga que não tem nada nesse dia. Não invente.',
     'Segurança: se o Ti falar em se machucar, em não querer viver, ou em perigo imediato, responda com cuidado, pergunte diretamente se ele está seguro, e lembre que o Samaritans atende 24 horas no 116 123 no Reino Unido e o CVV no 188 no Brasil.',
   ].join('\n');
 }
@@ -534,7 +568,7 @@ function segmentInstruction(pendingText, proposalText) {
     '2) addressed_question: true somente se o áudio terminar com uma pergunta dirigida a você (Robbie), e não uma pergunta que o Ti faz a si mesmo enquanto pensa.',
     '3) urgent: true somente se o Ti expressar intenção de se machucar, de não querer viver, ou perigo imediato.',
     '4) reply: a resposta do Robbie ao turno inteiro do Ti (trechos anteriores + este áudio), seguindo as regras do sistema.',
-    '5) calendar_action: "propose" se o Ti pedir para criar um evento ou lembrete no calendário, MESMO sem horário ou data (o servidor pergunta o que faltar; não ofereça, proponha) (preencha event: title curto, date AAAA-MM-DD, start HH:MM, end = horário de término HH:MM se o Ti disser o fim ou a duração, vazio só se ele não disser; use a data de hoje da agenda para entender "amanhã", "sexta" etc.); "confirm" somente se existir um evento proposto e o Ti disser claramente que sim; "cancel" se ele disser não ou desistir; senão "none".',
+    '5) calendar_action: "propose" se o Ti pedir para criar um evento ou lembrete no calendário, MESMO sem horário ou data (o servidor pergunta o que faltar; não ofereça, proponha) (preencha event: title curto, date AAAA-MM-DD, start HH:MM, end = horário de término HH:MM se o Ti disser o fim ou a duração, vazio só se ele não disser; use a data de hoje da agenda para entender "amanhã", "sexta" etc.; title é o assunto, nunca só "Lembrete" ou "Evento": se ele não disser o assunto, deixe title vazio); se existir um evento proposto e o Ti corrigir ou acrescentar algo (assunto, dia, horário, fim, duração), também "propose", preenchendo em event só o que ele mudou; "confirm" somente se existir um evento proposto e o Ti disser claramente que sim; "cancel" se ele disser não ou desistir; senão "none".',
   ].filter(Boolean).join('\n');
 }
 
@@ -735,7 +769,8 @@ function calendarDigest_(req) {
     var tomorrow = all.filter(function (e) { return e.getStartTime() >= tomorrowStart || (e.isAllDayEvent() && e.getEndTime() > tomorrowStart && e.getStartTime() >= tomorrowStart); })
       .slice(0, 15).map(line);
     out = { text: 'Agenda do Ti (calendário principal). Hoje, ' + spokenDay_(day.date) + ' (' + day.date + '): ' + (today.length ? '\n' + today.join('\n') : 'nenhum evento.') +
-      '\nAmanhã, ' + spokenDay_(tomorrowDate) + ' (' + tomorrowDate + '): ' + (tomorrow.length ? '\n' + tomorrow.join('\n') : 'nenhum evento.'),
+      '\nAmanhã, ' + spokenDay_(tomorrowDate) + ' (' + tomorrowDate + '): ' + (tomorrow.length ? '\n' + tomorrow.join('\n') : 'nenhum evento.') +
+      '\nVocê NÃO vê nenhum outro dia além de hoje e amanhã. Se o Ti perguntar de outro dia, diga que esse dia você ainda não consegue ver; não diga que está livre.', // v3.11 (N-3)
       status: 'events:' + today.length + '+' + tomorrow.length };
   } catch (err) {
     console.warn('calendar read failed: ' + err);
