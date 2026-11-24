@@ -82,12 +82,13 @@ function pcmBuffer(b64, rate, format) { // 16-bit signed little-endian mono PCM 
   let off = 0;
   if (format === 'wav' || bin.slice(0, 4) === 'RIFF') { const d = bin.indexOf('data', 12); off = d >= 0 ? d + 8 : 44; }
   const n = (bin.length - off) >> 1;
-  const buf = state.audioCtx.createBuffer(1, n, rate || 24000);
+  const lead = Math.round((rate || 24000) * 0.4); // M-1: 400 ms of silence first, so Android's audio route switch does not cut the first syllable
+  const buf = state.audioCtx.createBuffer(1, n + lead, rate || 24000);
   const ch = buf.getChannelData(0);
   for (let i = 0; i < n; i++) {
     let v = bin.charCodeAt(off + 2 * i) | (bin.charCodeAt(off + 2 * i + 1) << 8);
     if (v >= 32768) v -= 65536;
-    ch[i] = v / 32768;
+    ch[lead + i] = v / 32768;
   }
   return buf;
 }

@@ -1,5 +1,5 @@
 /**
- * Robbie v3.9 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
+ * Robbie v3.10 backend (Google Apps Script web app). Zero cost: no billing account anywhere.
  * Deploy: Execute as "Me", Who has access "Anyone".
  * Secrets live only in Script Properties (set by the one-time setup page): GEMINI_API_KEY, PASSPHRASE.
  * This file contains no keys, passphrases or spreadsheet IDs, so it can sit in a public repository.
@@ -119,7 +119,7 @@ function start_(req) {
 }
 
 // Ti, 23 Nov: no self-introduction each time; "Oi Ti" + time of day + a casual check-in, varied.
-var CHECK_INS = ['E aí, beleza?', 'Tudo certo?', 'Como é que tá?', 'Tudo bem?', 'Como vão as coisas?'];
+var CHECK_INS = ['E aí, beleza?', 'Tudo certo?']; // M-3: 2 per period (6 greeting texts a day at most), to save the daily voice quota
 function greetingText_(hour) {
   var h = Number(hour);
   if (!(h >= 0 && h <= 23) || hour === null || hour === undefined || hour === '') h = Number(Utilities.formatDate(new Date(), 'Europe/London', 'H'));
@@ -514,6 +514,7 @@ function systemInstruction() {
     'Por padrão, responda com uma única frase de no máximo ' + SHORT_LIMIT + ' palavras. Só quando o Ti pedir explicação ("explica", "fala mais", "por quê?") use até ' + LONG_LIMIT + ' palavras.',
     'Faça no máximo uma pergunta por resposta. Prefira perguntar a dar conselho. Não repita o que ele acabou de dizer.',
     'Quando o Ti contar uma decisão ou dúvida (cancelar, mudar, desistir, trocar), primeiro pergunte o motivo, numa pergunta curta; só dê opinião depois que ele explicar, ou se ele pedir de novo.',
+    'Se a resposta do Ti não explicar o motivo (por exemplo, se ele só disser qual evento é), pergunte de novo de outro jeito (por exemplo "O que te faz querer cancelar?"); não opine ainda.',
     'Não sugira que ele descanse, pare ou fique em casa, a não ser que ele mesmo fale em descansar.',
     'Humor leve e seco é bem-vindo quando o momento permite, ligado ao que ele disse. Nunca faça humor sobre sofrimento, crise ou assuntos sensíveis, a não ser que ele brinque primeiro.',
     'Não faça suposições sobre o estado ou as intenções dele; pergunte.',
